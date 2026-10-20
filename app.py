@@ -1,4 +1,36 @@
-        if ext in [".txt", ".eml"]:
+import streamlit as st
+import pandas as pd
+from io import BytesIO
+from pathlib import Path
+
+st.set_page_config(page_title="UBO Charter", page_icon="🔎", layout="wide")
+st.title("🔎 UBO Charter")
+st.caption("Prototype • Upload evidence, map ownership, and calculate ownership percentages.")
+st.warning("Prototype only. Verify every ownership link against source evidence. This tool does not determine legal UBO status or control.")
+
+SUPPORTED = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "eml"]
+
+def extract_text(uploaded_file):
+    ext = Path(uploaded_file.name).suffix.lower()
+    raw = uploaded_file.getvalue()
+    try:
+        if ext == ".pdf":
+            import fitz
+            doc = fitz.open(stream=raw, filetype="pdf")
+            return "\n".join(page.get_text() for page in doc)
+        if ext == ".docx":
+            from docx import Document
+            doc = Document(BytesIO(raw))
+            return "\n".join(p.text for p in doc.paragraphs)
+        if ext in [".xlsx", ".xls"]:
+            book = pd.ExcelFile(BytesIO(raw))
+            return "\n\n".join(
+                f"[Sheet: {sheet}]\n{pd.read_excel(BytesIO(raw), sheet_name=sheet).to_string(index=False)}"
+                for sheet in book.sheet_names
+            )
+        if ext == ".csv":
+            return pd.read_csv(BytesIO(raw)).to_string(index=False)
+                if ext in [".txt", ".eml"]:
             return raw.decode("utf-8", errors="replace")
         return "Unsupported file type."
     except Exception as exc:
