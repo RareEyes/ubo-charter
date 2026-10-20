@@ -24,9 +24,73 @@ def extract_text(uploaded_file):
                 for i, page in enumerate(doc)
             )
         if ext == ".docx":
-            from docx import Document
-            doc = Document(BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs)
+            import re
+            import xml.etree.ElementTree as ET
+            from zipfile import ZipFile
+
+            with ZipFile(BytesIO(raw)) as archive:
+                root = ET.fromstring(archive.read("word/document.xml"))
+
+            ns = {
+                "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                "v": "urn:schemas-microsoft-com:vml",
+            }
+
+            # Extract normal Word paragraphs
+            paragraphs = []
+            body = root.find("w:body", ns)
+            if body is not None:
+                for element in body.iter():
+                    if element.tag == f"{{{ns['w']}}}p":
+                        # Skip paragraphs inside floating text boxes
+                        if any(
+                            ancestor.tag == f"{{{ns['w']}}}txbxContent"
+                            for ancestor in []
+                        ):
+                            continue
+                        text = "".join(
+                            node.text or ""
+                            for node in element.findall(".//w:t", ns)
+                        )
+                        if text.strip():
+                            paragraphs.append(text.strip())
+
+            # Extract floating text boxes and their vertical positions
+            boxes = []
+            for pict in root.findall(".//w:pict", ns):
+                shape = pict.find(".//v:shape", ns)
+                if shape is None:
+                    continue
+
+                style = shape.get("style", "")
+                match = re.search(r"margin-top:([\d.]+)pt", style)
+                top = float(match.group(1)) if match else 0.0
+
+                text = "".join(
+                    node.text or ""
+                    for node in pict.findall(".//w:txbxContent//w:t", ns)
+                ).strip()
+
+                if text:
+                    boxes.append((top, text))
+
+            boxes.sort(key=lambda item: item[0])
+
+            result = []
+            if paragraphs:
+                result.append("Word paragraph text:\n" + "\n".join(paragraphs))
+
+            if boxes:
+                result.append(
+                    "Diagram text boxes, ordered from top to bottom "
+                    "(vertical positions in points):\n"
+                    + "\n".join(
+                        f"Vertical position {top}: {text}"
+                        for top, text in boxes
+                    )
+                )
+
+            return "\n\n".join(result) if result else "No readable Word text found."
         if ext in [".xlsx", ".xls"]:
             book = pd.ExcelFile(BytesIO(raw))
             return "\n\n".join(
