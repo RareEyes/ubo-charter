@@ -6,11 +6,7 @@ from pathlib import Path
 st.set_page_config(page_title="UBO Charter", page_icon="🔎", layout="wide")
 st.title("🔎 UBO Charter")
 st.caption("Prototype • Upload evidence, map ownership, and calculate ownership percentages.")
-
-st.warning(
-    "Prototype only: extracted document text is not automatically verified. "
-    "Review every ownership link against source evidence before using any result for KYC/AML decisions."
-)
+st.warning("Prototype only. Verify every ownership link against source evidence. This tool does not determine legal UBO status or control.")
 
 SUPPORTED = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "eml"]
 
@@ -28,45 +24,39 @@ def extract_text(uploaded_file):
             return "\n".join(p.text for p in doc.paragraphs)
         if ext in [".xlsx", ".xls"]:
             book = pd.ExcelFile(BytesIO(raw))
-            pieces = []
-            for sheet in book.sheet_names:
-                df = pd.read_excel(book, sheet_name=sheet)
-                pieces.append(f"[Sheet: {sheet}]\n{df.to_string(index=False)}")
-            return "\n\n".join(pieces)
+            return "\n\n".join(
+                f"[Sheet: {sheet}]\n{pd.read_excel(BytesIO(raw), sheet_name=sheet).to_string(index=False)}"
+                for sheet in book.sheet_names
+            )
         if ext == ".csv":
             return pd.read_csv(BytesIO(raw)).to_string(index=False)
         if ext in [".txt", ".eml"]:
             return raw.decode("utf-8", errors="replace")
         return "Unsupported file type."
-    except Exception as e:
-        return f"Could not extract text: {e}"
+    except Exception as exc:
+        return f"Could not extract text: {exc}"
 
 st.header("1. Upload company documents")
 uploads = st.file_uploader(
     "Select one or more documents",
     type=SUPPORTED,
-    accept_multiple_files=True,
-    help="Current prototype supports text-based PDF, DOCX, XLSX/XLS, CSV, TXT, and EML. Scanned PDFs and .msg email files need additional handling."
+    accept_multiple_files=True
 )
-
 if uploads:
     st.success(f"{len(uploads)} document(s) uploaded in this session.")
-    for i, file in enumerate(uploads):
-        with st.expander(f"{file.name} — extracted text preview", expanded=(i == 0)):
-            text = extract_text(file)
+    for i, uploaded in enumerate(uploads):
+        with st.expander(f"{uploaded.name} — extracted text preview", expanded=(i == 0)):
             st.text_area(
                 "Review extracted text",
-                value=text[:30000],
+                value=extract_text(uploaded)[:30000],
                 height=220,
                 key=f"preview_{i}"
             )
-            st.caption("Preview is limited to the first 30,000 characters.")
 else:
-    st.info("Upload documents to preview their readable text. Files are processed in this app session; do not use confidential client data in an unsecured deployment.")
+    st.info("Use dummy documents while testing. This prototype does not provide production-grade security.")
 
 st.header("2. Build the ownership chain")
-st.write("For this first version, enter verified ownership links manually. Automatic AI extraction will be added after we validate the calculation logic.")
-
+st.write("Each row means the owner holds the stated percentage of the owned entity.")
 if "owners" not in st.session_state:
     st.session_state.owners = pd.DataFrame([
         {"Owner / shareholder": "Person A", "Owned entity": "Holding Company", "Direct ownership (%)": 60.0, "Evidence / page": "Example only"},
@@ -86,97 +76,21 @@ edited = st.data_editor(
     key="ownership_editor",
 )
 st.session_state.owners = edited
-
 target = st.text_input("Target company to analyse", value="Target Company")
 
-def ownership_paths(edges, target_name):
-    graph = {}
-
+def ownership_paths(edges, target_name, max_depth=20):
+    # Rows are owner -> owned entity. Traverse backwards from target.
+    owners_by_entity = {}
     for _, row in edges.iterrows():
-        owner = str(row["Owner / shareholder"]).strip()
-        entity = str(row["Owned entity"]).strip()
-        pct = row["Direct ownership (%)"]
-
-        if owner and entity and pd.notna(pct):
-            graph.setdefault(entity.casefold(), []).append(
-                (owner, float(pct))
-            )
+        owner = str(row.get("Owner / shareholder", "")).strip()
+        entity = str(row.get("Owned entity", "")).strip()
+        pct = row.get("Direct ownership (%)")
+        if not owner or not entity or pd.isna(pct):
+            continue
+        pct = float(pct)
+        if 0 <= pct <= 100:
+            owners_by_entity.setdefault(entity.casefold(), []).append((owner, pct))
 
     results = []
 
-    def walk(entity, product, path, seen):
-        for owner, pct in graph.get(entity.casefold(), []):
-            if owner.casefold() in seen:
-                continue
-
-            ownership = product * pct / 100
-            new_path = [owner] + path
-
-            results.append((
-                owner,
-                "Direct" if len(path) == 1 else "Indirect",
-                round(ownership, 2),
-                " → ".join(new_path)
-            ))
-
-            walk(
-                owner,
-                ownership,
-                new_path,
-                seen | {owner.casefold()}
-            )
-
-    walk(target_name, 100.0, [target_name],
-         {target_name.casefold()})
-
-    return results
-if st.button("Calculate ownership", type="primary"):
-    if edited.empty:
-        st.error("Add at least one ownership link.")
-    else:
-        invalid = edited[
-            edited["Direct ownership (%)"].isna()
-            | (edited["Direct ownership (%)"] < 0)
-            | (edited["Direct ownership (%)"] > 100)
-        ]
-        if not invalid.empty:
-            st.error("Ownership percentages must be between 0 and 100.")
-        else:
-            rows = ownership_paths(edited, target.strip())
-            if not rows:
-                st.warning("No ownership chain to the target was found. Check entity names and the direction of the ownership links.")
-            else:
-                out = pd.DataFrame(
-    rows,
-    columns=[
-        "Owner / shareholder",
-        "Ownership type",
-        "Ownership via path (%)",
-        "Ownership path"
-    ]
-)
-
-out = out.sort_values(
-    "Ownership via path (%)",
-    ascending=False
-)
-
-st.subheader(f"Ownership paths to {target}")
-st.dataframe(out, use_container_width=True, hide_index=True)
-                out = out.sort_values("Indirect ownership via each path (%)", ascending=False)
-                st.subheader(f"Ownership paths to {target}")
-                st.dataframe(out, use_container_width=True, hide_index=True)
-                st.caption("This prototype lists path-level indirect percentages. It does not yet consolidate multiple paths for the same person, assess control, or determine legal UBO status.")
-                csv = out.to_csv(index=False).encode("utf-8")
-                st.download_button("Download path results (CSV)", csv, "ubo_charter_ownership_paths.csv", "text/csv")
-
-st.header("3. Planned next features")
-st.markdown("""
-- AI-assisted extraction of shareholders, entities, and percentages from uploaded documents
-- Direct / indirect / consolidated total ownership calculations, including multiple ownership paths
-- Ownership chart (individuals → intermediate entities → target company)
-- Evidence references by document and page
-- Review flags for missing, inconsistent, or conflicting information
-- PDF / Excel report export
-- Authentication and user-specific access (later phase)
-""")
+    def walk(entity, product, chain, seen, depth):
