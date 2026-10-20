@@ -18,11 +18,30 @@ def extract_text(uploaded_file):
     try:
         if ext == ".pdf":
             import fitz
+
             doc = fitz.open(stream=raw, filetype="pdf")
-            return "\n".join(
-                f"[Page {i + 1}]\n{page.get_text()}"
-                for i, page in enumerate(doc)
-            )
+            pages = []
+
+            for page_num, page in enumerate(doc, start=1):
+                blocks = page.get_text("blocks", sort=True)
+                page_parts = []
+
+                for block in blocks:
+                    x0, y0, x1, y1, text = block[:5]
+                    text = text.strip()
+
+                    if text:
+                        page_parts.append(
+                            f"Position (x={x0:.0f}, y={y0:.0f}): {text}"
+                        )
+
+                if page_parts:
+                    pages.append(
+                        f"[Page {page_num}]\n"
+                        + "\n".join(page_parts)
+                    )
+
+            return "\n\n".join(pages) if pages else "No readable PDF text found."
         if ext == ".docx":
             import re
             import xml.etree.ElementTree as ET
