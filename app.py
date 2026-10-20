@@ -235,7 +235,7 @@ with settings_col1:
 with settings_col2:
     main_entity = st.text_input(
         "Main Entity",
-        value=st.session_state.get("main_entity", "Target Company"),
+        value=st.session_state.get("main_entity", ""),
         key="main_entity"
     )
 
@@ -341,19 +341,12 @@ st.header("3. Review ownership links")
 st.write("Each row means the owner holds the stated percentage of the owned entity.")
 
 if "owners" not in st.session_state:
-    st.session_state.owners = pd.DataFrame([
-        {
-            "Owner / shareholder": "Person A",
-            "Owned entity": "Holding Company",
-            "Direct ownership (%)": 60.0,
-            "Evidence / page": "Example only"
-        },
-        {
-            "Owner / shareholder": "Holding Company",
-            "Owned entity": "Target Company",
-            "Direct ownership (%)": 40.0,
-            "Evidence / page": "Example only"
-        },
+    # Start empty: never show fictional ownership links as if they came from evidence.
+    st.session_state.owners = pd.DataFrame(columns=[
+        "Owner / shareholder",
+        "Owned entity",
+        "Direct ownership (%)",
+        "Evidence / page",
     ])
 
 edited = st.data_editor(
