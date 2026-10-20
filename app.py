@@ -123,6 +123,7 @@ DOCUMENT TEXT:
                 with st.spinner("Analysing documents with AI..."):
                     response = client.chat.completions.create(
                         model="qwen/qwen3.8-27b",
+                        max_tokens=800,
                         messages=[
                             {
                                 "role": "system",
