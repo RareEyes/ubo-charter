@@ -30,7 +30,7 @@ def extract_text(uploaded_file):
             )
         if ext == ".csv":
             return pd.read_csv(BytesIO(raw)).to_string(index=False)
-                if ext in [".txt", ".eml"]:
+            if ext in [".txt", ".eml"]:
             return raw.decode("utf-8", errors="replace")
         return "Unsupported file type."
     except Exception as exc:
