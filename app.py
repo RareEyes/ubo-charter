@@ -146,7 +146,23 @@ if st.button("Calculate ownership", type="primary"):
             if not rows:
                 st.warning("No ownership chain to the target was found. Check entity names and the direction of the ownership links.")
             else:
-                out = pd.DataFrame(rows, columns=["Owner / shareholder", "Indirect ownership via each path (%)", "Ownership path"])
+                out = pd.DataFrame(
+    rows,
+    columns=[
+        "Owner / shareholder",
+        "Ownership type",
+        "Ownership via path (%)",
+        "Ownership path"
+    ]
+)
+
+out = out.sort_values(
+    "Ownership via path (%)",
+    ascending=False
+)
+
+st.subheader(f"Ownership paths to {target}")
+st.dataframe(out, use_container_width=True, hide_index=True)
                 out = out.sort_values("Indirect ownership via each path (%)", ascending=False)
                 st.subheader(f"Ownership paths to {target}")
                 st.dataframe(out, use_container_width=True, hide_index=True)
