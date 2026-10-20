@@ -90,35 +90,46 @@ st.session_state.owners = edited
 target = st.text_input("Target company to analyse", value="Target Company")
 
 def ownership_paths(edges, target_name):
-    # Enumerate ownership paths from any owner to target; multiply percentages along each path.
     graph = {}
+
     for _, row in edges.iterrows():
-        owner = str(row.get("Owner / shareholder", "")).strip()
-        entity = str(row.get("Owned entity", "")).strip()
-        pct = row.get("Direct ownership (%)", 0)
-        if not owner or not entity or pd.isna(pct):
-            continue
-        try:
-            pct = float(pct)
-        except Exception:
-            continue
-        if pct < 0 or pct > 100:
-            continue
-        graph.setdefault(entity, []).append((owner, pct / 100.0))
+        owner = str(row["Owner / shareholder"]).strip()
+        entity = str(row["Owned entity"]).strip()
+        pct = row["Direct ownership (%)"]
+
+        if owner and entity and pd.notna(pct):
+            graph.setdefault(entity.casefold(), []).append(
+                (owner, float(pct))
+            )
 
     results = []
+
     def walk(entity, product, path, seen):
-        for owner, pct in graph.get(entity, []):
-            if owner in seen:
+        for owner, pct in graph.get(entity.casefold(), []):
+            if owner.casefold() in seen:
                 continue
-            new_product = product * pct
+
+            ownership = product * pct / 100
             new_path = [owner] + path
-            results.append((owner, new_product * 100, " → ".join(new_path + [entity])))
-            walk(owner, new_product, new_path, seen | {owner})
 
-    walk(target_name, 1.0, [target_name], {target_name})
+            results.append((
+                owner,
+                "Direct" if len(path) == 1 else "Indirect",
+                round(ownership, 2),
+                " → ".join(new_path)
+            ))
+
+            walk(
+                owner,
+                ownership,
+                new_path,
+                seen | {owner.casefold()}
+            )
+
+    walk(target_name, 100.0, [target_name],
+         {target_name.casefold()})
+
     return results
-
 if st.button("Calculate ownership", type="primary"):
     if edited.empty:
         st.error("Add at least one ownership link.")
