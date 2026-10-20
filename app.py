@@ -13,8 +13,12 @@ SUPPORTED = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "eml"]
 
 
 def extract_text(uploaded_file):
+    import xml.etree.ElementTree as ET
+    from zipfile import ZipFile
+
     ext = Path(uploaded_file.name).suffix.lower()
     raw = uploaded_file.getvalue()
+
     try:
         if ext == ".pdf":
             import fitz
@@ -23,93 +27,147 @@ def extract_text(uploaded_file):
             pages = []
 
             for page_num, page in enumerate(doc, start=1):
-                blocks = page.get_text("blocks", sort=True)
-                page_parts = []
+                parts = []
 
-                for block in blocks:
+                # Extract selectable text and its coordinates.
+                for block in page.get_text("blocks", sort=True):
                     x0, y0, x1, y1, text = block[:5]
                     text = text.strip()
-
                     if text:
-                        page_parts.append(
-                            f"Position (x={x0:.0f}, y={y0:.0f}): {text}"
+                        parts.append(
+                            f"Position x={x0:.0f}, y={y0:.0f}: {text}"
                         )
 
-                if page_parts:
+                # Try OCR when a page has no selectable text.
+                if not parts:
+                    try:
+                        import pytesseract
+                        from PIL import Image
+
+                        pix = page.get_pixmap(
+                            matrix=fitz.Matrix(2, 2), alpha=False
+                        )
+                        image = Image.frombytes(
+                            "RGB", [pix.width, pix.height], pix.samples
+                        )
+                        ocr_text = pytesseract.image_to_string(image).strip()
+
+                        if ocr_text:
+                            parts.append("OCR text:\n" + ocr_text)
+                    except Exception:
+                        parts.append(
+                            "No selectable text found. OCR is unavailable "
+                            "or not configured for this page."
+                        )
+
+                if parts:
                     pages.append(
-                        f"[Page {page_num}]\n"
-                        + "\n".join(page_parts)
+                        f"[Page {page_num}]\n" + "\n".join(parts)
                     )
 
-            return "\n\n".join(pages) if pages else "No readable PDF text found."
-        if ext == ".docx":
-            import re
-            import xml.etree.ElementTree as ET
-            from zipfile import ZipFile
+            return "\n\n".join(pages) or "No readable PDF text found."
 
+        if ext == ".docx":
             with ZipFile(BytesIO(raw)) as archive:
-                root = ET.fromstring(archive.read("word/document.xml"))
+                root = ET.fromstring(
+                    archive.read("word/document.xml")
+                )
 
             ns = {
                 "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-                "v": "urn:schemas-microsoft-com:vml",
+                "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
             }
 
-            # Extract normal Word paragraphs
-            paragraphs = []
             body = root.find("w:body", ns)
+            paragraphs = []
+
+            # Read ordinary paragraphs and table text, avoiding
+            # duplicate text from inside floating shapes.
+            def read_normal_text(element):
+                tag = element.tag.split("}")[-1]
+
+                if tag in {"drawing", "pict", "txbxContent"}:
+                    return ""
+
+                if tag == "t":
+                    return element.text or ""
+
+                return "".join(read_normal_text(child) for child in element)
+
+            def walk_body(element):
+                tag = element.tag.split("}")[-1]
+
+                if tag == "p":
+                    text = read_normal_text(element).strip()
+                    if text:
+                        paragraphs.append(text)
+                    return
+
+                if tag in {"drawing", "pict", "txbxContent"}:
+                    return
+
+                for child in element:
+                    walk_body(child)
+
             if body is not None:
-                for element in body.iter():
-                    if element.tag == f"{{{ns['w']}}}p":
-                        # Skip paragraphs inside floating text boxes
-                        if any(
-                            ancestor.tag == f"{{{ns['w']}}}txbxContent"
-                            for ancestor in []
-                        ):
-                            continue
-                        text = "".join(
-                            node.text or ""
-                            for node in element.findall(".//w:t", ns)
-                        )
-                        if text.strip():
-                            paragraphs.append(text.strip())
+                walk_body(body)
 
-            # Extract floating text boxes and their vertical positions
-            boxes = []
-            for pict in root.findall(".//w:pict", ns):
-                shape = pict.find(".//v:shape", ns)
-                if shape is None:
-                    continue
+            # Read modern Word floating drawing shapes and text boxes.
+            shapes = []
 
-                style = shape.get("style", "")
-                match = re.search(r"margin-top:([\d.]+)pt", style)
-                top = float(match.group(1)) if match else 0.0
-
-                text = "".join(
-                    node.text or ""
-                    for node in pict.findall(".//w:txbxContent//w:t", ns)
+            for anchor in root.findall(".//wp:anchor", ns):
+                text = "\n".join(
+                    "".join(t.text or "" for t in paragraph.findall(".//w:t", ns))
+                    for paragraph in anchor.findall(".//w:txbxContent//w:p", ns)
                 ).strip()
 
-                if text:
-                    boxes.append((top, text))
+                # Some shapes contain text without a standard text box.
+                if not text:
+                    text = "".join(
+                        t.text or "" for t in anchor.findall(".//w:t", ns)
+                    ).strip()
 
-            boxes.sort(key=lambda item: item[0])
+                if not text:
+                    continue
+
+                h = anchor.find("wp:positionH/wp:posOffset", ns)
+                v = anchor.find("wp:positionV/wp:posOffset", ns)
+
+                # Word coordinates use EMUs; 12,700 EMUs = 1 point.
+                x = round(int(h.text) / 12700, 1) if h is not None else None
+                y = round(int(v.text) / 12700, 1) if v is not None else None
+
+                shapes.append((y, x, text))
+
+            shapes.sort(
+                key=lambda item: (
+                    item[0] if item[0] is not None else float("inf"),
+                    item[1] if item[1] is not None else float("inf"),
+                )
+            )
 
             result = []
-            if paragraphs:
-                result.append("Word paragraph text:\n" + "\n".join(paragraphs))
 
-            if boxes:
+            if paragraphs:
                 result.append(
-                    "Diagram text boxes, ordered from top to bottom "
-                    "(vertical positions in points):\n"
-                    + "\n".join(
-                        f"Vertical position {top}: {text}"
-                        for top, text in boxes
-                    )
+                    "Ordinary document text:\n" + "\n".join(paragraphs)
                 )
 
-            return "\n\n".join(result) if result else "No readable Word text found."
+            if shapes:
+                shape_lines = []
+                for y, x, text in shapes:
+                    shape_lines.append(
+                        f"Diagram shape (vertical offset={y}, "
+                        f"horizontal offset={x} points): {text}"
+                    )
+
+                result.append(
+                    "Floating diagram shapes, approximately top to bottom:\n"
+                    + "\n".join(shape_lines)
+                )
+
+            return "\n\n".join(result) or "No readable Word text found."
+
         if ext in [".xlsx", ".xls"]:
             book = pd.ExcelFile(BytesIO(raw))
             return "\n\n".join(
@@ -117,11 +175,15 @@ def extract_text(uploaded_file):
                 f"{pd.read_excel(BytesIO(raw), sheet_name=sheet).to_string(index=False)}"
                 for sheet in book.sheet_names
             )
+
         if ext == ".csv":
             return pd.read_csv(BytesIO(raw)).to_string(index=False)
+
         if ext in [".txt", ".eml"]:
             return raw.decode("utf-8", errors="replace")
+
         return "Unsupported file type."
+
     except Exception as exc:
         return f"Could not extract text: {exc}"
 
