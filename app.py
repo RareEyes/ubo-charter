@@ -1,35 +1,3 @@
-import streamlit as st
-import pandas as pd
-from io import BytesIO
-from pathlib import Path
-
-st.set_page_config(page_title="UBO Charter", page_icon="🔎", layout="wide")
-st.title("🔎 UBO Charter")
-st.caption("Prototype • Upload evidence, map ownership, and calculate ownership percentages.")
-st.warning("Prototype only. Verify every ownership link against source evidence. This tool does not determine legal UBO status or control.")
-
-SUPPORTED = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "eml"]
-
-def extract_text(uploaded_file):
-    ext = Path(uploaded_file.name).suffix.lower()
-    raw = uploaded_file.getvalue()
-    try:
-        if ext == ".pdf":
-            import fitz
-            doc = fitz.open(stream=raw, filetype="pdf")
-            return "\n".join(page.get_text() for page in doc)
-        if ext == ".docx":
-            from docx import Document
-            doc = Document(BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs)
-        if ext in [".xlsx", ".xls"]:
-            book = pd.ExcelFile(BytesIO(raw))
-            return "\n\n".join(
-                f"[Sheet: {sheet}]\n{pd.read_excel(BytesIO(raw), sheet_name=sheet).to_string(index=False)}"
-                for sheet in book.sheet_names
-            )
-        if ext == ".csv":
-            return pd.read_csv(BytesIO(raw)).to_string(index=False)
         if ext in [".txt", ".eml"]:
             return raw.decode("utf-8", errors="replace")
         return "Unsupported file type."
@@ -94,3 +62,62 @@ def ownership_paths(edges, target_name, max_depth=20):
     results = []
 
     def walk(entity, product, chain, seen, depth):
+        if depth >= max_depth:
+            return
+        for owner, pct in owners_by_entity.get(entity.casefold(), []):
+            owner_key = owner.casefold()
+            if owner_key in seen:
+                continue
+            ownership = product * pct / 100.0
+            new_chain = [owner] + chain
+            results.append({
+                "Owner / shareholder": owner,
+                "Ownership type": "Direct" if depth == 0 else "Indirect",
+                "Ownership via path (%)": round(ownership, 2),
+                "Ownership path": " → ".join(new_chain),
+            })
+            walk(owner, ownership, new_chain, seen | {owner_key}, depth + 1)
+
+    walk(target_name.strip(), 100.0, [target_name.strip()], {target_name.strip().casefold()}, 0)
+    return results
+
+if st.button("Calculate ownership", type="primary"):
+    if edited.empty:
+        st.error("Add at least one ownership link.")
+    elif (
+        edited["Direct ownership (%)"].isna().any()
+        or (edited["Direct ownership (%)"] < 0).any()
+        or (edited["Direct ownership (%)"] > 100).any()
+    ):
+        st.error("Ownership percentages must be between 0 and 100.")
+    else:
+        rows = ownership_paths(edited, target)
+        if not rows:
+            st.warning("No ownership chain to the target was found. Check entity names and ownership-link direction.")
+        else:
+            out = pd.DataFrame(rows, columns=[
+                "Owner / shareholder",
+                "Ownership type",
+                "Ownership via path (%)",
+                "Ownership path",
+            ])
+            out = out.sort_values("Ownership via path (%)", ascending=False)
+            st.subheader(f"Ownership paths to {target}")
+            st.dataframe(out, use_container_width=True, hide_index=True)
+            st.caption("These are path-level interests. Multiple paths need consolidation and validation. This prototype does not assess voting rights, control, or legal UBO status.")
+            st.download_button(
+                "Download path results (CSV)",
+                out.to_csv(index=False).encode("utf-8"),
+                "ubo_charter_ownership_paths.csv",
+                "text/csv",
+            )
+
+st.header("3. Planned next features")
+st.markdown("""
+- AI-assisted extraction of shareholders, entities, and percentages from documents
+- Consolidated direct, indirect, and total ownership, including multiple ownership paths
+- Ownership chart and source evidence references
+- Flags for missing, inconsistent, or conflicting information
+- PDF / Excel report export
+- Authentication and user-specific access
+""")
