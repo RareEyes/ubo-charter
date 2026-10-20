@@ -200,44 +200,14 @@ document_text = ""
 if uploads:
     st.success(f"{len(uploads)} document(s) uploaded in this session.")
     extracted_documents = []
-
-    for i, uploaded in enumerate(uploads):
+    for uploaded in uploads:
         text_content = extract_text(uploaded)
         extracted_documents.append(
             f"\n\nDOCUMENT: {uploaded.name}\n{text_content}"
         )
-        with st.expander(
-            f"{uploaded.name} — extracted text preview",
-            expanded=(i == 0)
-        ):
-            st.text_area(
-                "Review extracted text",
-                value=text_content[:30000],
-                height=220,
-                key=f"preview_{i}"
-            )
-
     document_text = "\n".join(extracted_documents)
 else:
-    st.info("Upload documents to preview their text and extract ownership links.")
-
-st.header("2. Analysis settings")
-settings_col1, settings_col2 = st.columns(2)
-with settings_col1:
-    ownership_threshold = st.number_input(
-        "Ownership Percentage",
-        min_value=0.0,
-        max_value=100.0,
-        value=25.0,
-        step=1.0,
-        help="Minimum total direct and indirect ownership percentage for the UBO summary. Confirm the applicable threshold for your jurisdiction."
-    )
-with settings_col2:
-    main_entity = st.text_input(
-        "Main Entity",
-        value=st.session_state.get("main_entity", ""),
-        key="main_entity"
-    )
+    st.info("Upload documents to extract ownership links.")
 
 if uploads and st.button("Extract ownership links with AI", type="primary"):
     if not document_text.strip():
@@ -337,8 +307,27 @@ DOCUMENT TEXT:
         except Exception as exc:
             st.error(f"AI extraction failed: {exc}")
 
+
+st.header("2. Analysis settings")
+settings_col1, settings_col2 = st.columns(2)
+with settings_col1:
+    ownership_threshold = st.number_input(
+        "Ownership Percentage",
+        min_value=0.0,
+        max_value=100.0,
+        value=25.0,
+        step=1.0,
+        help="Minimum total direct and indirect ownership percentage for the UBO summary. Confirm the applicable threshold for your jurisdiction."
+    )
+with settings_col2:
+    main_entity = st.text_input(
+        "Main Entity",
+        value=st.session_state.get("main_entity", ""),
+        key="main_entity"
+    )
+
 st.header("3. Review ownership links")
-st.write("Each row means the owner holds the stated percentage of the owned entity.")
+st.write("Review or correct the ownership links extracted from your documents before generating results.")
 
 if "owners" not in st.session_state:
     # Start empty: never show fictional ownership links as if they came from evidence.
@@ -444,7 +433,7 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=20):
     return rows
 
 
-if st.button("Calculate ownership", type="primary"):
+if st.button("Generate UBO Results", type="primary"):
     if not main_entity.strip():
         st.error("Enter the Main Entity.")
     elif edited.empty:
@@ -488,7 +477,7 @@ if st.button("Calculate ownership", type="primary"):
                     "based on the ownership links currently provided."
                 )
 
-            st.subheader("Ownership Structure")
+            st.subheader("Ownership Structure — Main Entity and intermediary layers")
             structure_rows = build_ownership_structure(
                 owners_by_entity, main_entity
             )
