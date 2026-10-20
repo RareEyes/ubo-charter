@@ -311,6 +311,20 @@ DOCUMENT TEXT:
             if rows:
                 st.session_state.owners = pd.DataFrame(rows)
                 st.session_state.pop("ownership_editor", None)
+
+                # Suggest the likely Main Entity: an entity that is owned
+                # by another party but does not itself appear as an owner.
+                owner_names = {row["Owner / shareholder"].strip().casefold() for row in rows}
+                owned_entities = [row["Owned entity"].strip() for row in rows]
+                terminal_entities = [
+                    entity for entity in owned_entities
+                    if entity and entity.casefold() not in owner_names
+                ]
+                if terminal_entities:
+                    st.session_state["main_entity"] = terminal_entities[-1]
+                elif owned_entities:
+                    st.session_state["main_entity"] = owned_entities[-1]
+
                 st.success(f"Extracted {len(rows)} ownership link(s). Review them below.")
                 st.rerun()
             else:
