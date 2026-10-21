@@ -545,7 +545,7 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
-    """Show each direct link plus its path-based contribution to the main entity."""
+    """Show direct ownership, path contribution to the main entity, and total contribution across appearances."""
     rows = []
     queue = [(main_entity.strip(), 0, 100.0, frozenset({main_entity.strip().casefold()}))]
 
@@ -558,13 +558,30 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
             contribution = entity_share_of_main * pct / 100.0
             rows.append({
                 "Entity": entity,
-                "Shareholder / ownership": f"{owner} — {pct:g}%",
-                "Total Ownership of Main Entity": f"{contribution:g}%",
+                "Shareholder / ownership": owner,
+                "Ownership %": pct,
+                "Ownership % in Current Company": contribution,
+                "Total Ownership %": None,
                 "_depth": depth,
             })
             owner_key = owner.casefold()
             if owner_key in owners_by_entity and owner_key not in path_seen:
                 queue.append((owner, depth + 1, contribution, path_seen | {owner_key}))
+
+    # Aggregate each shareholder/entity's effective contributions across every row where
+    # its name appears. Keep the path-specific contribution in the preceding column.
+    total_by_owner = {}
+    display_by_owner = {}
+    for row in rows:
+        owner = row["Shareholder / ownership"]
+        key = owner.casefold()
+        total_by_owner[key] = total_by_owner.get(key, 0.0) + row["Ownership % in Current Company"]
+        display_by_owner.setdefault(key, owner)
+    for row in rows:
+        key = row["Shareholder / ownership"].casefold()
+        row["Ownership %"] = f"{row['Ownership %']:g}%"
+        row["Ownership % in Current Company"] = f"{row['Ownership % in Current Company']:g}%"
+        row["Total Ownership %"] = f"{total_by_owner[key]:g}%"
 
     # Keep each entity label on its first row, matching the requested example layout.
     previous_entity = None
@@ -734,7 +751,8 @@ DOCUMENT TEXT:
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
                     if structure_rows:
                         structure_df = pd.DataFrame(structure_rows)[[
-                            "Entity", "Shareholder / ownership", "Total Ownership of Main Entity"
+                            "Entity", "Shareholder / ownership", "Ownership %",
+                            "Ownership % in Current Company", "Total Ownership %"
                         ]]
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
