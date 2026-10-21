@@ -297,6 +297,8 @@ def extract_written_ownership_links(document_text):
         if not match:
             continue
         entity = match.group("entity").strip(" .,:;")
+        # PDF text blocks are prefixed with their page coordinates by extract_text().
+        entity = re.sub(r"(?i)^position\s+x\s*=\s*[-\d.]+\s*,\s*y\s*=\s*[-\d.]+\s*:\s*", "", entity)
         entity = re.sub(r"(?i)^company\b", "Company", entity)
         entity = re.sub(r"(?i)^mr\.\s*", "Mr. ", entity)
         entity = re.sub(r"(?i)^ms\.\s*", "Ms. ", entity)
@@ -634,14 +636,23 @@ DOCUMENT TEXT:
                         "Evidence / page": str(link.get("evidence", "")),
                     })
 
-            # Add a deterministic fallback for simple vertical charts. OCR text
-            # alone often loses arrow direction, so use the relative positions of
-            # labels and percentage markers to recover adjacent ownership links.
-            # If OCR contains sentence-style ownership statements, parse those
-            # statements directly before considering any spatial diagram inference.
+            # Parse sentence-style ownership statements as an additional source.
+            # Do not replace the AI's full extraction with a partial OCR parse: OCR
+            # may recognize only the last line of a scanned page. Merge exact links.
             written_rows = extract_written_ownership_links(document_text)
-            if len(written_rows) >= 2:
-                rows = written_rows
+            if written_rows:
+                merged = []
+                seen_links = set()
+                for link in rows + written_rows:
+                    key = (
+                        str(link.get("Owner / shareholder", "")).strip().casefold(),
+                        str(link.get("Owned entity", "")).strip().casefold(),
+                        round(float(link.get("Direct ownership (%)", 0)), 4),
+                    )
+                    if key not in seen_links:
+                        seen_links.add(key)
+                        merged.append(link)
+                rows = merged
 
             diagram_rows = infer_diagram_links(document_text)
             # Coordinate-based inference is intended for visual diagrams only.
@@ -663,16 +674,45 @@ DOCUMENT TEXT:
             if not rows:
                 st.warning("No ownership links with clear percentages were identified. Check that the document contains readable ownership details.")
             else:
+                # Always clean coordinate prefixes before building the ownership graph.
+                for row in rows:
+                    for field in ("Owned entity", "Owner / shareholder"):
+                        row[field] = re.sub(
+                            r"(?i)^position\s+x\s*=\s*[-\d.]+\s*,\s*y\s*=\s*[-\d.]+\s*:\s*",
+                            "", str(row[field])
+                        ).strip()
+                # Normalize and deduplicate after cleaning prefixes, because the
+                # AI and OCR parser may describe the same link with different labels.
+                normalized_rows = []
+                seen_normalized = set()
+                for row in rows:
+                    key = (
+                        row["Owner / shareholder"].casefold(),
+                        row["Owned entity"].casefold(),
+                        round(float(row["Direct ownership (%)"]), 4),
+                    )
+                    if key not in seen_normalized:
+                        seen_normalized.add(key)
+                        normalized_rows.append(row)
+                rows = normalized_rows
                 owners_by_entity = build_ownership_map(rows)
                 main_entity = main_entity_input.strip()
                 if not main_entity:
-                    owner_names = {row["Owner / shareholder"].casefold() for row in rows}
-                    terminal_entities = [
-                        row["Owned entity"].strip() for row in rows
-                        if row["Owned entity"].strip().casefold() not in owner_names
-                    ]
-                    main_entity = terminal_entities[-1] if terminal_entities else rows[-1]["Owned entity"]
+                    # The main entity is normally the owned entity that is never
+                    # itself listed as a shareholder/owner in the extracted graph.
+                    owner_names = {row["Owner / shareholder"].strip().casefold() for row in rows}
+                    candidates = []
+                    for row in rows:
+                        entity = row["Owned entity"].strip()
+                        if entity and entity.casefold() not in owner_names and entity.casefold() not in [c.casefold() for c in candidates]:
+                            candidates.append(entity)
+                    main_entity = candidates[0] if candidates else rows[0]["Owned entity"].strip()
                     st.info(f"Main Entity inferred from the document: **{main_entity}**")
+                else:
+                    main_entity = re.sub(
+                        r"(?i)^position\s+x\s*=\s*[-\d.]+\s*,\s*y\s*=\s*[-\d.]+\s*:\s*",
+                        "", main_entity
+                    ).strip()
 
                 if main_entity.casefold() not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
