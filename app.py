@@ -670,8 +670,8 @@ if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads))
             client = Groq(api_key=st.secrets["GROQ_API_KEY"])
             prompt = f"""
 You are extracting direct ownership links from corporate documents, including scanned ownership charts and diagrams.
-Return ONLY valid JSON in this exact structure:
-{{"ownership_links":[{{"owner":"Shareholder name","owned_entity":"Company name","direct_ownership_percent":25.0,"evidence":"Filename and page, sheet, or diagram evidence"}}]}}
+Return ONLY compact valid JSON in this exact structure:
+{{"ownership_links":[{{"owner":"Shareholder name","owned_entity":"Company name","direct_ownership_percent":25.0}}]}}
 
 Rules:
 - Each link means the owner directly owns the stated percentage of the owned entity.
@@ -681,7 +681,7 @@ Rules:
 - For the common ownership-chart layout used in these documents, the company being analysed is at the top and its shareholders are in boxes below it, with arrows pointing DOWN from the company to each shareholder. In this layout, the LOWER box is the owner/shareholder and the UPPER box is the owned entity. For example, ABC Pvt Ltd at the top with XYZ LLC below and 40% beside the connecting downward arrow means XYZ LLC owns 40% of ABC Pvt Ltd.
 - Repeat this rule at every layer: if Myrah Company is below ABC Pvt Ltd, and Masiha Ltd and Wiqas LLC are below Myrah Company, then Myrah Company owns part of ABC Pvt Ltd while Masiha Ltd and Wiqas LLC own parts of Myrah Company.
 - Follow the visible arrow direction when it is clear. Do not reverse ownership links based only on which label appears first in extracted text. A percentage label beside a connecting branch applies to that direct owner-to-entity link.
-- Extract every supported link across all layers. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship.
+- Extract every supported link across all layers. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship. Keep the JSON compact; omit evidence and explanations.
 - OCR text may include normalized coordinates x and y (0 to 1). Smaller y means nearer the top of the page. Use these positions to distinguish labels belonging to different levels of a diagram.
 - Never invent names, percentages, or unsupported relationships. Do not calculate indirect percentages.
 - Return an empty array only if no direct ownership links are supported.
@@ -693,7 +693,7 @@ DOCUMENT TEXT:
             with st.spinner("Extracting ownership links and calculating results..."):
                 response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=1800,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Extract ownership data accurately and return valid JSON only."},
                         {"role": "user", "content": build_model_content(prompt, visual_images)},
@@ -731,7 +731,7 @@ SOURCE:
 {document_text[:35000]}"""
                 retry_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=1800,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Return a single valid JSON object only."},
                         {"role": "user", "content": build_model_content(retry_prompt, visual_images)},
@@ -769,7 +769,7 @@ SOURCE:
 {document_text[:35000]}"""
                 completeness_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=1800,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Return a complete direct-ownership graph as one valid JSON object only."},
                         {"role": "user", "content": build_model_content(completeness_prompt, visual_images)},
