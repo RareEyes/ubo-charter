@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -96,7 +97,16 @@ def extract_text(uploaded_file):
                     f"{word} [x={x / max(width, 1):.3f}, y={y / max(height, 1):.3f}]"
                     for y, x, word in detections
                 ]
-                return "OCR words with normalized page positions (0=left/top, 1=right/bottom):\n" + "\n".join(positioned)
+                # Preserve ordinary sentence order as well as word coordinates.
+                # Coordinates alone can scramble a scanned written statement.
+                full_text = pytesseract.image_to_string(image, config="--psm 6").strip()
+                if not full_text:
+                    full_text = pytesseract.image_to_string(image, config="--psm 4").strip()
+                return (
+                    "OCR full-page text (preserve sentence meaning):\n" + full_text +
+                    "\n\nOCR words with normalized page positions (0=left/top, 1=right/bottom):\n" +
+                    "\n".join(positioned)
+                )
 
             # Last fallback for scanned pages if positioned OCR returns nothing.
             return pytesseract.image_to_string(image, config="--psm 6").strip()
@@ -246,6 +256,89 @@ def extract_text(uploaded_file):
     except Exception as exc:
         return f"Could not extract text: {exc}"
 
+
+
+
+def extract_written_ownership_links(document_text):
+    """Parse clear sentence-style ownership statements from OCR/plain text.
+
+    This deterministic path avoids using spatial diagram heuristics on scanned
+    prose, where nearby words and percentages can otherwise be joined incorrectly.
+    """
+    import re
+
+    # Keep the readable OCR section and remove the coordinate-word listing.
+    text = document_text
+    text = re.sub(
+        r"(?i)OCR words with normalized page positions.*",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    # Tesseract sometimes joins the final entity word to "is" (e.g. "Company Ais").
+    text = re.sub(
+        r"(?i)\b(Company\s+[A-Z0-9]+)(is owned|are owned|was owned|were owned)\b",
+        r"\1 \2",
+        text,
+    )
+
+    extracted = []
+    # Each statement generally occupies one OCR line. The entity is the subject
+    # of the sentence; every percentage-owner pair is a direct owner of it.
+    for line in text.splitlines():
+        line = line.strip().strip("•- ")
+        if not line or line.startswith("OCR full-page text") or line.startswith("[Page") or line.startswith("DOCUMENT:"):
+            continue
+        match = re.match(
+            r"^(?P<entity>.+?)\s+(?:is|are|was|were)\s+owned\s+(?P<owners>.+?)\s*[.;]?\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        entity = match.group("entity").strip(" .,:;")
+        entity = re.sub(r"(?i)^company\b", "Company", entity)
+        entity = re.sub(r"(?i)^mr\.\s*", "Mr. ", entity)
+        entity = re.sub(r"(?i)^ms\.\s*", "Ms. ", entity)
+        owner_text = match.group("owners").strip()
+        pct_matches = list(re.finditer(r"(?P<pct>\d+(?:\.\d+)?)\s*%", owner_text))
+        if not entity or not pct_matches:
+            continue
+
+        for i, pct_match in enumerate(pct_matches):
+            try:
+                pct = float(pct_match.group("pct"))
+            except ValueError:
+                continue
+            if not 0 <= pct <= 100:
+                continue
+            end = pct_matches[i + 1].start() if i + 1 < len(pct_matches) else len(owner_text)
+            owner = owner_text[pct_match.end():end]
+            owner = re.sub(r"^\s*(?:shares?\s*)?(?:owned\s*)?(?:by\s+)?", "", owner, flags=re.IGNORECASE)
+            owner = re.sub(r"^\s*(?:and|,)+\s*", "", owner, flags=re.IGNORECASE)
+            owner = re.sub(r"\s*(?:and|,)+\s*$", "", owner, flags=re.IGNORECASE)
+            owner = owner.strip(" .,:;-")
+            if owner.casefold().startswith("by "):
+                owner = owner[3:].strip()
+            # OCR can retain the separator "and" immediately before a name.
+            owner = re.sub(r"^(?:and\s+)+", "", owner, flags=re.IGNORECASE).strip()
+            if owner and re.search(r"[A-Za-z]", owner):
+                extracted.append({
+                    "Owner / shareholder": owner,
+                    "Owned entity": entity,
+                    "Direct ownership (%)": pct,
+                    "Evidence / page": "Parsed from written ownership statement in OCR text; verify against source",
+                })
+
+    # Deduplicate exact links while preserving document order.
+    unique = []
+    seen = set()
+    for row in extracted:
+        key = (row["Owner / shareholder"].casefold(), row["Owned entity"].casefold(), row["Direct ownership (%)"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
 
 
 def infer_diagram_links(document_text):
@@ -450,23 +543,26 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
+    """Show each direct link plus its path-based contribution to the main entity."""
     rows = []
-    queue = [(main_entity.strip(), 0, frozenset({main_entity.strip().casefold()}))]
+    queue = [(main_entity.strip(), 0, 100.0, frozenset({main_entity.strip().casefold()}))]
 
     while queue:
-        entity, depth, path_seen = queue.pop(0)
+        entity, depth, entity_share_of_main, path_seen = queue.pop(0)
         if depth >= max_depth:
             continue
         direct_owners = owners_by_entity.get(entity.casefold(), [])
         for owner, pct in direct_owners:
+            contribution = entity_share_of_main * pct / 100.0
             rows.append({
                 "Entity": entity,
                 "Shareholder / ownership": f"{owner} — {pct:g}%",
+                "Total Ownership of Main Entity": f"{contribution:g}%",
                 "_depth": depth,
             })
             owner_key = owner.casefold()
             if owner_key in owners_by_entity and owner_key not in path_seen:
-                queue.append((owner, depth + 1, path_seen | {owner_key}))
+                queue.append((owner, depth + 1, contribution, path_seen | {owner_key}))
 
     # Keep each entity label on its first row, matching the requested example layout.
     previous_entity = None
@@ -493,7 +589,9 @@ Return ONLY valid JSON in this exact structure:
 
 Rules:
 - Each link means the owner directly owns the stated percentage of the owned entity.
-- Carefully use ALL names, company labels, percentage labels, spatial positions, and diagram layout. Do not stop after extracting only the bottom relationship.
+- Carefully use ALL names, company labels, percentage labels, spatial positions, and diagram layout. Do not stop after extracting only one relationship.
+- For scanned written sentences, prioritize the OCR full-page text and preserve the sentence meaning. Example: "Company A is owned 100% by Company B" means owner="Company B", owned_entity="Company A", direct_ownership_percent=100. Example: "Company B is owned 50% by Company C and 50% by Mr. A" means two links: Company C owns 50% of Company B, and Mr. A owns 50% of Company B.
+- A phrase like "Company D is owned by 25% by Mr. C, 35% by Mr. D and 40% by Mr. E" means Company D is owned 25% by Mr. C, 35% by Mr. D, and 40% by Mr. E.
 - For a vertical ownership chart, inspect each adjacent pair of nodes from bottom to top. If an arrow starts at a lower company and points upward to the node above, interpret the upper node as the owner/shareholder and the lower company as the owned entity.
 - A percentage label placed beside the arrow between two nodes applies to that direct ownership link.
 - Example: a chart with Mr. Mobile at the top, Company B in the middle, Company A at the bottom, and 100% beside each upward arrow means two links: Mr. Mobile owns Company B 100%; Company B owns Company A 100%.
@@ -539,11 +637,27 @@ DOCUMENT TEXT:
             # Add a deterministic fallback for simple vertical charts. OCR text
             # alone often loses arrow direction, so use the relative positions of
             # labels and percentage markers to recover adjacent ownership links.
+            # If OCR contains sentence-style ownership statements, parse those
+            # statements directly before considering any spatial diagram inference.
+            written_rows = extract_written_ownership_links(document_text)
+            if len(written_rows) >= 2:
+                rows = written_rows
+
             diagram_rows = infer_diagram_links(document_text)
-            # When positioned OCR yields a coherent diagram graph, prefer those
-            # spatially grounded links over AI-generated links that may merge
-            # separate left/right branches or hallucinate OCR debris.
-            if len(diagram_rows) >= 2:
+            # Coordinate-based inference is intended for visual diagrams only.
+            # If OCR found natural-language ownership sentences, keep the AI links
+            # extracted from those sentences; line/word positions can otherwise
+            # incorrectly connect unrelated phrases in a written scan.
+            ocr_full_text = "\n".join(
+                line for line in document_text.splitlines()
+                if not line.strip().startswith("OCR words with normalized page positions")
+                and not re.search(r"\[x=0?\.\d+, y=0?\.\d+\]$", line.strip())
+            )
+            has_written_ownership = bool(re.search(
+                r"(?i)\b(is|are|was|were)\s+(?:owned|held)\b|\bowned\s+\d+(?:\.\d+)?%\s+by\b",
+                ocr_full_text
+            ))
+            if len(diagram_rows) >= 2 and not has_written_ownership and len(written_rows) < 2:
                 rows = diagram_rows
 
             if not rows:
@@ -579,7 +693,9 @@ DOCUMENT TEXT:
                     st.subheader("Ownership Structure")
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
                     if structure_rows:
-                        structure_df = pd.DataFrame(structure_rows)[["Entity", "Shareholder / ownership"]]
+                        structure_df = pd.DataFrame(structure_rows)[[
+                            "Entity", "Shareholder / ownership", "Total Ownership of Main Entity"
+                        ]]
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No ownership structure could be built from the extracted links.")
