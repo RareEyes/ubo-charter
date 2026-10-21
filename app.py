@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import re
+import base64
 from io import BytesIO
 from pathlib import Path
 
@@ -259,6 +260,67 @@ def extract_text(uploaded_file):
 
 
 
+
+def extract_visual_images(uploaded_file, limit=3):
+    """Return a few page images for direct multimodal diagram reading by Groq."""
+    from PIL import Image
+
+    ext = Path(uploaded_file.name).suffix.lower()
+    raw = uploaded_file.getvalue()
+    output = []
+
+    def encode_image(image, label):
+        image = image.convert("RGB")
+        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=86, optimize=True)
+        data_uri = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+        output.append({"label": label, "data_uri": data_uri})
+
+    try:
+        if ext == ".pdf":
+            import fitz
+            pdf = fitz.open(stream=raw, filetype="pdf")
+            for page_index in range(min(len(pdf), max(0, limit))):
+                page = pdf[page_index]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                image = Image.open(BytesIO(pix.tobytes("png")))
+                encode_image(image, f"{uploaded_file.name}, page {page_index + 1}")
+                if len(output) >= limit:
+                    break
+        elif ext == ".docx":
+            # Include embedded diagram images where present. Word shape-based charts
+            # are handled from their extracted text-box labels and positions.
+            with ZipFile(BytesIO(raw)) as archive:
+                media = sorted(n for n in archive.namelist() if n.startswith("word/media/"))
+                for media_name in media[:max(0, limit)]:
+                    try:
+                        image = Image.open(BytesIO(archive.read(media_name)))
+                        encode_image(image, f"{uploaded_file.name}, embedded image {Path(media_name).name}")
+                    except Exception:
+                        continue
+                    if len(output) >= limit:
+                        break
+    except Exception:
+        return []
+    return output
+
+
+def build_model_content(prompt, visual_images):
+    """Create a Groq multimodal user message with text and optional page images."""
+    content = [{"type": "text", "text": prompt}]
+    for item in visual_images[:3]:
+        content.append({
+            "type": "text",
+            "text": f"Visual source: {item['label']}. Inspect the diagram layout, arrows, boxes, labels, and percentages directly.",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": item["data_uri"]},
+        })
+    return content
+
+
 def extract_written_ownership_links(document_text):
     """Parse clear sentence-style ownership statements from OCR/plain text.
 
@@ -344,12 +406,12 @@ def extract_written_ownership_links(document_text):
 
 
 def infer_diagram_links(document_text):
-    """Infer links from OCR word coordinates for simple ownership diagrams.
+    """Infer links from OCR word coordinates for simple top-down ownership diagrams.
 
     OCR is clustered in two dimensions so labels on the left and right sides of
-    a branching diagram are kept separate. Percentage labels are connected to
-    the nearest upper and lower nodes in the same visual column/branch.
-    For diagrams with upward ownership arrows, the upper node is the owner.
+    a branching diagram are kept separate. For the standard layout used here,
+    the upper node is the owned entity and the lower node is its owner/shareholder.
+    This is only a fallback; AI-extracted complete graphs take precedence.
     """
     import re
 
@@ -456,9 +518,11 @@ def infer_diagram_links(document_text):
         owned = min(lower, key=lambda n: 2.0 * abs(n["x"] - marker["x"]) + 0.35 * abs(n["y"] - marker["y"]))
         if owner["label"].casefold() == owned["label"].casefold():
             continue
+        # In this common top-down chart layout, the lower box is the shareholder
+        # and the upper box is the company whose ownership is being shown.
         edge = {
-            "Owner / shareholder": owner["label"],
-            "Owned entity": owned["label"],
+            "Owner / shareholder": owned["label"],
+            "Owned entity": owner["label"],
             "Direct ownership (%)": marker["pct"],
             "Evidence / page": "Inferred from OCR label positions and nearby percentage in the diagram; verify against source",
         }
@@ -478,12 +542,15 @@ uploads = st.file_uploader(
 )
 
 document_text = ""
+visual_images = []
 if uploads:
     st.success(f"{len(uploads)} document(s) uploaded in this session.")
     extracted_documents = []
     for uploaded in uploads:
         text_content = extract_text(uploaded)
         extracted_documents.append(f"\n\nDOCUMENT: {uploaded.name}\n{text_content}")
+        if len(visual_images) < 3:
+            visual_images.extend(extract_visual_images(uploaded, limit=3 - len(visual_images)))
     document_text = "\n".join(extracted_documents)
 else:
     st.info("Upload one or more documents to begin.")
@@ -541,7 +608,7 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
                 totals[owner_key] = totals.get(owner_key, 0.0) + contribution
 
     walk(main_entity.strip(), 100.0, {main_entity.strip().casefold()}, 0)
-    return [(display_names[k], round(v, 2)) for k, v in totals.items()]
+    return [(display_names[k], round(v, 4)) for k, v in totals.items()]
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
@@ -608,13 +675,13 @@ Return ONLY valid JSON in this exact structure:
 
 Rules:
 - Each link means the owner directly owns the stated percentage of the owned entity.
-- Carefully use ALL names, company labels, percentage labels, spatial positions, and diagram layout. Do not stop after extracting only one relationship.
+- Carefully use ALL names, company labels, percentage labels, spatial positions, and diagram layout. When a page image is supplied, inspect the actual boxes, connectors, and arrow directions directly; OCR text can miss labels. Do not stop after extracting only one relationship.
 - For scanned written sentences, prioritize the OCR full-page text and preserve the sentence meaning. Example: "Company A is owned 100% by Company B" means owner="Company B", owned_entity="Company A", direct_ownership_percent=100. Example: "Company B is owned 50% by Company C and 50% by Mr. A" means two links: Company C owns 50% of Company B, and Mr. A owns 50% of Company B.
 - A phrase like "Company D is owned by 25% by Mr. C, 35% by Mr. D and 40% by Mr. E" means Company D is owned 25% by Mr. C, 35% by Mr. D, and 40% by Mr. E.
-- For a vertical ownership chart, inspect each adjacent pair of nodes from bottom to top. If an arrow starts at a lower company and points upward to the node above, interpret the upper node as the owner/shareholder and the lower company as the owned entity.
-- A percentage label placed beside the arrow between two nodes applies to that direct ownership link.
-- Example: a chart with Mr. Mobile at the top, Company B in the middle, Company A at the bottom, and 100% beside each upward arrow means two links: Mr. Mobile owns Company B 100%; Company B owns Company A 100%.
-- If a person or company appears above an entity in a diagram, do not automatically assume ownership solely from vertical position; use arrows and percentage labels when available. But do follow a clear top-to-bottom ownership chain and extract every supported link.
+- For the common ownership-chart layout used in these documents, the company being analysed is at the top and its shareholders are in boxes below it, with arrows pointing DOWN from the company to each shareholder. In this layout, the LOWER box is the owner/shareholder and the UPPER box is the owned entity. For example, ABC Pvt Ltd at the top with XYZ LLC below and 40% beside the connecting downward arrow means XYZ LLC owns 40% of ABC Pvt Ltd.
+- Repeat this rule at every layer: if Myrah Company is below ABC Pvt Ltd, and Masiha Ltd and Wiqas LLC are below Myrah Company, then Myrah Company owns part of ABC Pvt Ltd while Masiha Ltd and Wiqas LLC own parts of Myrah Company.
+- Follow the visible arrow direction when it is clear. Do not reverse ownership links based only on which label appears first in extracted text. A percentage label beside a connecting branch applies to that direct owner-to-entity link.
+- Extract every supported link across all layers. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship.
 - OCR text may include normalized coordinates x and y (0 to 1). Smaller y means nearer the top of the page. Use these positions to distinguish labels belonging to different levels of a diagram.
 - Never invent names, percentages, or unsupported relationships. Do not calculate indirect percentages.
 - Return an empty array only if no direct ownership links are supported.
@@ -626,17 +693,95 @@ DOCUMENT TEXT:
             with st.spinner("Extracting ownership links and calculating results..."):
                 response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=800,
+                    max_tokens=1800,
                     messages=[
                         {"role": "system", "content": "Extract ownership data accurately and return valid JSON only."},
-                        {"role": "user", "content": prompt},
+                        {"role": "user", "content": build_model_content(prompt, visual_images)},
                     ],
                     temperature=0,
+                    response_format={"type": "json_object"},
                 )
 
             result_text = (response.choices[0].message.content or "").strip()
-            result_text = result_text.replace("```json", "").replace("```", "").strip()
-            result = json.loads(result_text)
+
+            def parse_ownership_json(text):
+                text = (text or "").strip()
+                text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+                text = re.sub(r"\s*```$", "", text)
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    # Some model responses include a short preamble or trailing text.
+                    start = text.find("{")
+                    end = text.rfind("}")
+                    if start < 0 or end <= start:
+                        raise
+                    parsed = json.loads(text[start:end + 1])
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("ownership_links"), list):
+                    raise json.JSONDecodeError("Expected an ownership_links array", text, 0)
+                return parsed
+
+            try:
+                result = parse_ownership_json(result_text)
+            except json.JSONDecodeError:
+                # Retry once with a shorter instruction and a compact JSON-only response.
+                retry_prompt = f"""Extract ALL direct ownership links from the source below. The company at the top of a typical chart is the owned entity; lower connected shareholder boxes own the percentages shown beside their branches. Follow every layer. Return ONLY compact valid JSON, no markdown, with this exact shape: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. Do not include explanations or evidence fields. Do not calculate indirect percentages. Never invent links.
+
+SOURCE:
+{document_text[:35000]}"""
+                retry_response = client.chat.completions.create(
+                    model="qwen/qwen3.8-27b",
+                    max_tokens=1800,
+                    messages=[
+                        {"role": "system", "content": "Return a single valid JSON object only."},
+                        {"role": "user", "content": build_model_content(retry_prompt, visual_images)},
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                retry_text = (retry_response.choices[0].message.content or "").strip()
+                result = parse_ownership_json(retry_text)
+
+            # A response can be valid JSON but still omit most links from a large
+            # diagram. If the source contains many separate percentage labels and
+            # no sentence-style ownership statements, ask once for a complete compact
+            # link list before calculating anything.
+            diagram_pct_counts = [
+                len(re.findall(r"(?m)^Diagram shape .*?:\s*\d+(?:\.\d+)?\s*%\s*$", document_text)),
+                len(re.findall(r"(?m)^Position x=.*?:\s*\d+(?:\.\d+)?\s*%\s*$", document_text)),
+                len(re.findall(r"(?m)^\s*\d+(?:\.\d+)?\s*%\s+\[x=0?\.\d+,\s*y=0?\.\d+\]\s*$", document_text)),
+            ]
+            diagram_pct_count = max(diagram_pct_counts)
+            has_written_ownership = bool(re.search(
+                r"(?i)\b(?:is|are|was|were)\s+(?:\d+(?:\.\d+)?%\s+)?(?:owned|held)\b|\bowned\s+\d+(?:\.\d+)?%\s+by\b",
+                document_text
+            ))
+            current_links = result.get("ownership_links", [])
+            minimum_expected_links = max(2, int(diagram_pct_count * 0.7))
+            if (
+                not has_written_ownership
+                and diagram_pct_count >= 3
+                and len(current_links) < minimum_expected_links
+            ):
+                completeness_prompt = f"""Extract every direct ownership link in this MULTI-LAYER OWNERSHIP DIAGRAM. The company at the top is the owned entity; connected shareholder boxes below it own the percentages shown beside their branches. Continue through every lower layer. The source contains about {diagram_pct_count} separate percentage labels, so check that each label is assigned to the correct connected owner and entity. Return ONLY compact valid JSON: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. No explanations, no markdown, no indirect calculations, and do not invent links.
+
+SOURCE:
+{document_text[:35000]}"""
+                completeness_response = client.chat.completions.create(
+                    model="qwen/qwen3.8-27b",
+                    max_tokens=1800,
+                    messages=[
+                        {"role": "system", "content": "Return a complete direct-ownership graph as one valid JSON object only."},
+                        {"role": "user", "content": build_model_content(completeness_prompt, visual_images)},
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                completeness_text = (completeness_response.choices[0].message.content or "").strip()
+                completeness_result = parse_ownership_json(completeness_text)
+                if len(completeness_result.get("ownership_links", [])) > len(current_links):
+                    result = completeness_result
+
             rows = []
             for link in result.get("ownership_links", []):
                 owner = str(link.get("owner", "")).strip()
@@ -671,22 +816,10 @@ DOCUMENT TEXT:
                         merged.append(link)
                 rows = merged
 
-            diagram_rows = infer_diagram_links(document_text)
-            # Coordinate-based inference is intended for visual diagrams only.
-            # If OCR found natural-language ownership sentences, keep the AI links
-            # extracted from those sentences; line/word positions can otherwise
-            # incorrectly connect unrelated phrases in a written scan.
-            ocr_full_text = "\n".join(
-                line for line in document_text.splitlines()
-                if not line.strip().startswith("OCR words with normalized page positions")
-                and not re.search(r"\[x=0?\.\d+, y=0?\.\d+\]$", line.strip())
-            )
-            has_written_ownership = bool(re.search(
-                r"(?i)\b(is|are|was|were)\s+(?:owned|held)\b|\bowned\s+\d+(?:\.\d+)?%\s+by\b",
-                ocr_full_text
-            ))
-            if len(diagram_rows) >= 2 and not has_written_ownership and len(written_rows) < 2:
-                rows = diagram_rows
+            # Do not auto-substitute nearest-label diagram guesses here. In multi-layer
+            # charts, that heuristic can attach a percentage to the wrong branch. The
+            # AI receives the OCR text and normalized word coordinates above; retain its
+            # extracted graph (plus deterministic written-statement links) instead.
 
             if not rows:
                 st.warning("No ownership links with clear percentages were identified. Check that the document contains readable ownership details.")
