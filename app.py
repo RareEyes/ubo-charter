@@ -26,12 +26,11 @@ def extract_text(uploaded_file):
             import pytesseract
             from PIL import Image, ImageOps, ImageEnhance
 
+            # Keep the original RGB image for OCR. On the ownership-chart PDF,
+            # grayscale preprocessing caused Tesseract to miss the top owner name.
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
-            image = ImageOps.grayscale(image)
-            image = ImageEnhance.Contrast(image).enhance(1.5)
-
             data = pytesseract.image_to_data(
-                image, config="--psm 11", output_type=pytesseract.Output.DICT
+                image, config="--psm 3", output_type=pytesseract.Output.DICT
             )
             width, height = image.size
             items = []
@@ -57,7 +56,7 @@ def extract_text(uploaded_file):
                 ]
                 return "OCR words with normalized page positions (0=left/top, 1=right/bottom):\n" + "\n".join(positioned)
 
-            return pytesseract.image_to_string(image, config="--psm 11").strip()
+            return pytesseract.image_to_string(image, config="--psm 3").strip()
         except Exception:
             return ""
 
@@ -83,7 +82,7 @@ def extract_text(uploaded_file):
                 # images, where a diagram may contain additional labels.
                 has_images = bool(page.get_images(full=True))
                 if not parts or has_images:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
                     image_bytes = pix.tobytes("png")
                     ocr_text = ocr_image_bytes(image_bytes)
                     if ocr_text:
@@ -204,6 +203,105 @@ def extract_text(uploaded_file):
     except Exception as exc:
         return f"Could not extract text: {exc}"
 
+
+
+def infer_vertical_diagram_links(document_text):
+    """Fallback for simple vertical ownership charts using OCR word positions.
+
+    If OCR detects positioned labels and percentages, infer links between adjacent
+    entity/person labels from top to bottom, using the percentage positioned
+    between each pair. This supplements—not replaces—the AI extraction.
+    """
+    import re
+    from collections import defaultdict
+
+    token_pattern = re.compile(
+        r"(?P<word>.+?) \[x=(?P<x>0?\.?\d+), y=(?P<y>0?\.?\d+)\]$"
+    )
+    tokens = []
+    for raw_line in document_text.splitlines():
+        match = token_pattern.match(raw_line.strip())
+        if match:
+            word = match.group("word").strip()
+            try:
+                x, y = float(match.group("x")), float(match.group("y"))
+            except ValueError:
+                continue
+            tokens.append((y, x, word))
+
+    if len(tokens) < 4:
+        return []
+
+    tokens.sort()
+    # Group OCR words on the same visual line (small y-coordinate differences).
+    lines = []
+    for y, x, word in tokens:
+        if not lines or abs(y - lines[-1]["y_mean"]) > 0.025:
+            lines.append({"ys": [y], "words": [(x, word)]})
+        else:
+            lines[-1]["ys"].append(y)
+            lines[-1]["words"].append((x, word))
+        lines[-1]["y_mean"] = sum(lines[-1]["ys"]) / len(lines[-1]["ys"])
+
+    visual_lines = []
+    for line in lines:
+        text = " ".join(word for _, word in sorted(line["words"]))
+        visual_lines.append((line["y_mean"], text.strip()))
+
+    pct_lines = []
+    node_lines = []
+    ignored = {"shares", "share", "ownership", "owned", "by", "of", "the"}
+    for y, text in visual_lines:
+        pct_match = re.search(r"(?<!\d)(100|[1-9]?\d(?:\.\d+)?)\s*%", text)
+        if pct_match:
+            pct = float(pct_match.group(1))
+            if 0 <= pct <= 100:
+                pct_lines.append((y, pct))
+            # Do not classify a percentage label such as “100% Shares” as a node.
+            continue
+
+        words = re.findall(r"[A-Za-z][A-Za-z0-9.&'’-]*", text)
+        meaningful = [w for w in words if w.casefold() not in ignored]
+        if not meaningful:
+            continue
+        # Exclude common diagram annotations, while keeping company/person names.
+        if all(w.casefold() in {"page", "image", "ocr", "text", "position"} for w in meaningful):
+            continue
+        label = " ".join(meaningful).strip()
+        if label:
+            node_lines.append((y, label))
+
+    # Deduplicate repeated OCR labels, preserving their top-to-bottom order.
+    nodes = []
+    for y, label in sorted(node_lines):
+        if nodes and label.casefold() == nodes[-1][1].casefold() and abs(y - nodes[-1][0]) < 0.04:
+            continue
+        nodes.append((y, label))
+
+    if len(nodes) < 2:
+        return []
+
+    inferred = []
+    for idx in range(len(nodes) - 1):
+        upper_y, upper_label = nodes[idx]
+        lower_y, lower_label = nodes[idx + 1]
+        if upper_label.casefold() == lower_label.casefold() or lower_y <= upper_y:
+            continue
+        between = [(y, pct) for y, pct in pct_lines if upper_y < y < lower_y]
+        if not between:
+            continue
+        # The closest percentage label to the midpoint is most likely attached
+        # to the connector between these adjacent nodes.
+        midpoint = (upper_y + lower_y) / 2
+        pct_y, pct = min(between, key=lambda item: abs(item[0] - midpoint))
+        inferred.append({
+            "Owner / shareholder": upper_label,
+            "Owned entity": lower_label,
+            "Direct ownership (%)": pct,
+            "Evidence / page": "Inferred from OCR positions in a vertical diagram; verify against source",
+        })
+
+    return inferred
 
 
 st.header("1. Upload company documents")
@@ -366,6 +464,23 @@ DOCUMENT TEXT:
                         "Direct ownership (%)": pct,
                         "Evidence / page": str(link.get("evidence", "")),
                     })
+
+            # Add a deterministic fallback for simple vertical charts. OCR text
+            # alone often loses arrow direction, so use the relative positions of
+            # labels and percentage markers to recover adjacent ownership links.
+            diagram_rows = infer_vertical_diagram_links(document_text)
+            known_links = {
+                (r["Owner / shareholder"].casefold(), r["Owned entity"].casefold())
+                for r in rows
+            }
+            for diagram_row in diagram_rows:
+                link_key = (
+                    diagram_row["Owner / shareholder"].casefold(),
+                    diagram_row["Owned entity"].casefold(),
+                )
+                if link_key not in known_links:
+                    rows.append(diagram_row)
+                    known_links.add(link_key)
 
             if not rows:
                 st.warning("No ownership links with clear percentages were identified. Check that the document contains readable ownership details.")
