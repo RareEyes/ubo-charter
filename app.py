@@ -30,7 +30,7 @@ def extract_text(uploaded_file):
             # grayscale preprocessing caused Tesseract to miss the top owner name.
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
             data = pytesseract.image_to_data(
-                image, config="--psm 3", output_type=pytesseract.Output.DICT
+                image, config="--psm 11", output_type=pytesseract.Output.DICT
             )
             width, height = image.size
             items = []
@@ -205,101 +205,129 @@ def extract_text(uploaded_file):
 
 
 
-def infer_vertical_diagram_links(document_text):
-    """Fallback for simple vertical ownership charts using OCR word positions.
+def infer_diagram_links(document_text):
+    """Infer links from OCR word coordinates for simple ownership diagrams.
 
-    If OCR detects positioned labels and percentages, infer links between adjacent
-    entity/person labels from top to bottom, using the percentage positioned
-    between each pair. This supplements—not replaces—the AI extraction.
+    OCR is clustered in two dimensions so labels on the left and right sides of
+    a branching diagram are kept separate. Percentage labels are connected to
+    the nearest upper and lower nodes in the same visual column/branch.
+    For diagrams with upward ownership arrows, the upper node is the owner.
     """
     import re
-    from collections import defaultdict
 
     token_pattern = re.compile(
-        r"(?P<word>.+?) \[x=(?P<x>0?\.?\d+), y=(?P<y>0?\.?\d+)\]$"
+        r"(?P<word>.+?) \[x=(?P<x>0?\.\d+|1(?:\.0+)?), y=(?P<y>0?\.\d+|1(?:\.0+)?)\]$"
     )
     tokens = []
     for raw_line in document_text.splitlines():
         match = token_pattern.match(raw_line.strip())
-        if match:
-            word = match.group("word").strip()
-            try:
-                x, y = float(match.group("x")), float(match.group("y"))
-            except ValueError:
-                continue
-            tokens.append((y, x, word))
+        if not match:
+            continue
+        word = match.group("word").strip()
+        try:
+            x, y = float(match.group("x")), float(match.group("y"))
+        except ValueError:
+            continue
+        # Discard OCR debris from arrows/diagram borders.
+        cleaned = re.sub(r"[^A-Za-z0-9%.'&-]", "", word)
+        if not cleaned or cleaned.casefold() in {"an", "os", "y", "n", "m"}:
+            continue
+        tokens.append({"x": x, "y": y, "word": word, "cleaned": cleaned})
 
     if len(tokens) < 4:
         return []
 
-    tokens.sort()
-    # Group OCR words on the same visual line (small y-coordinate differences).
-    lines = []
-    for y, x, word in tokens:
-        if not lines or abs(y - lines[-1]["y_mean"]) > 0.025:
-            lines.append({"ys": [y], "words": [(x, word)]})
+    # First form close horizontal text rows, then split each row into separate
+    # labels based on horizontal gaps (unlike the previous version, which merged
+    # both sides of a branching chart into one label).
+    tokens.sort(key=lambda t: (t["y"], t["x"]))
+    rows = []
+    for token in tokens:
+        if not rows or abs(token["y"] - rows[-1]["y_mean"]) > 0.020:
+            rows.append({"items": [token], "y_mean": token["y"]})
         else:
-            lines[-1]["ys"].append(y)
-            lines[-1]["words"].append((x, word))
-        lines[-1]["y_mean"] = sum(lines[-1]["ys"]) / len(lines[-1]["ys"])
+            rows[-1]["items"].append(token)
+            rows[-1]["y_mean"] = sum(t["y"] for t in rows[-1]["items"]) / len(rows[-1]["items"])
 
-    visual_lines = []
-    for line in lines:
-        text = " ".join(word for _, word in sorted(line["words"]))
-        visual_lines.append((line["y_mean"], text.strip()))
+    clusters = []
+    for row in rows:
+        row_items = sorted(row["items"], key=lambda t: t["x"])
+        current = []
+        for token in row_items:
+            if current and token["x"] - current[-1]["x"] > 0.115:
+                clusters.append(current)
+                current = []
+            current.append(token)
+        if current:
+            clusters.append(current)
 
-    pct_lines = []
-    node_lines = []
+    nodes = []
+    percentages = []
     ignored = {"shares", "share", "ownership", "owned", "by", "of", "the"}
-    for y, text in visual_lines:
-        pct_match = re.search(r"(?<!\d)(100|[1-9]?\d(?:\.\d+)?)\s*%", text)
-        if pct_match:
-            pct = float(pct_match.group(1))
-            if 0 <= pct <= 100:
-                pct_lines.append((y, pct))
-            # Do not classify a percentage label such as “100% Shares” as a node.
+    for cluster in clusters:
+        text = " ".join(t["word"] for t in cluster).strip()
+        y = sum(t["y"] for t in cluster) / len(cluster)
+        pct_token = next((t for t in cluster if "%" in t["cleaned"]), None)
+        if pct_token:
+            match = re.search(r"(?<!\d)(100|\d{1,2}(?:\.\d+)?)\s*%", pct_token["word"])
+            if match:
+                pct = float(match.group(1))
+                if 0 <= pct <= 100:
+                    percentages.append({"x": pct_token["x"], "y": y, "pct": pct})
             continue
 
-        words = re.findall(r"[A-Za-z][A-Za-z0-9.&'’-]*", text)
-        meaningful = [w for w in words if w.casefold() not in ignored]
+        words = [t["word"] for t in cluster]
+        meaningful = [w for w in words if re.sub(r"[^A-Za-z0-9]", "", w).casefold() not in ignored]
+        # Filter punctuation, isolated diagram symbols, and OCR specks.
+        meaningful = [w for w in meaningful if re.search(r"[A-Za-z]{2,}|[A-Z]\b", w)]
         if not meaningful:
             continue
-        # Exclude common diagram annotations, while keeping company/person names.
-        if all(w.casefold() in {"page", "image", "ocr", "text", "position"} for w in meaningful):
+        label = " ".join(meaningful).strip(" .|_-=~{}[]")
+        if not label or len(label) < 2:
             continue
-        label = " ".join(meaningful).strip()
-        if label:
-            node_lines.append((y, label))
-
-    # Deduplicate repeated OCR labels, preserving their top-to-bottom order.
-    nodes = []
-    for y, label in sorted(node_lines):
-        if nodes and label.casefold() == nodes[-1][1].casefold() and abs(y - nodes[-1][0]) < 0.04:
+        # Reject common OCR artefacts while preserving ordinary person/company labels.
+        if label.casefold() in {"a os", "os", "a", "an", "shares"}:
             continue
-        nodes.append((y, label))
+        nodes.append({
+            "x": sum(t["x"] for t in cluster) / len(cluster),
+            "y": y,
+            "label": label,
+        })
 
-    if len(nodes) < 2:
+    # Deduplicate labels close together, keeping the stronger first occurrence.
+    deduped = []
+    for node in sorted(nodes, key=lambda n: (n["y"], n["x"])):
+        if any(n["label"].casefold() == node["label"].casefold()
+               and abs(n["x"] - node["x"]) < 0.04 and abs(n["y"] - node["y"]) < 0.04
+               for n in deduped):
+            continue
+        deduped.append(node)
+    nodes = deduped
+    if len(nodes) < 2 or not percentages:
         return []
 
     inferred = []
-    for idx in range(len(nodes) - 1):
-        upper_y, upper_label = nodes[idx]
-        lower_y, lower_label = nodes[idx + 1]
-        if upper_label.casefold() == lower_label.casefold() or lower_y <= upper_y:
+    for marker in percentages:
+        upper = [n for n in nodes if n["y"] < marker["y"] - 0.015]
+        lower = [n for n in nodes if n["y"] > marker["y"] + 0.015]
+        if not upper or not lower:
             continue
-        between = [(y, pct) for y, pct in pct_lines if upper_y < y < lower_y]
-        if not between:
+        # Favor nodes in the same branch/column, while also preferring nearby
+        # vertical neighbours over nodes from a different layer.
+        owner = min(upper, key=lambda n: 2.0 * abs(n["x"] - marker["x"]) + 0.35 * abs(n["y"] - marker["y"]))
+        owned = min(lower, key=lambda n: 2.0 * abs(n["x"] - marker["x"]) + 0.35 * abs(n["y"] - marker["y"]))
+        if owner["label"].casefold() == owned["label"].casefold():
             continue
-        # The closest percentage label to the midpoint is most likely attached
-        # to the connector between these adjacent nodes.
-        midpoint = (upper_y + lower_y) / 2
-        pct_y, pct = min(between, key=lambda item: abs(item[0] - midpoint))
-        inferred.append({
-            "Owner / shareholder": upper_label,
-            "Owned entity": lower_label,
-            "Direct ownership (%)": pct,
-            "Evidence / page": "Inferred from OCR positions in a vertical diagram; verify against source",
-        })
+        edge = {
+            "Owner / shareholder": owner["label"],
+            "Owned entity": owned["label"],
+            "Direct ownership (%)": marker["pct"],
+            "Evidence / page": "Inferred from OCR label positions and nearby percentage in the diagram; verify against source",
+        }
+        if not any(e["Owner / shareholder"].casefold() == edge["Owner / shareholder"].casefold()
+                   and e["Owned entity"].casefold() == edge["Owned entity"].casefold()
+                   for e in inferred):
+            inferred.append(edge)
 
     return inferred
 
@@ -468,19 +496,12 @@ DOCUMENT TEXT:
             # Add a deterministic fallback for simple vertical charts. OCR text
             # alone often loses arrow direction, so use the relative positions of
             # labels and percentage markers to recover adjacent ownership links.
-            diagram_rows = infer_vertical_diagram_links(document_text)
-            known_links = {
-                (r["Owner / shareholder"].casefold(), r["Owned entity"].casefold())
-                for r in rows
-            }
-            for diagram_row in diagram_rows:
-                link_key = (
-                    diagram_row["Owner / shareholder"].casefold(),
-                    diagram_row["Owned entity"].casefold(),
-                )
-                if link_key not in known_links:
-                    rows.append(diagram_row)
-                    known_links.add(link_key)
+            diagram_rows = infer_diagram_links(document_text)
+            # When positioned OCR yields a coherent diagram graph, prefer those
+            # spatially grounded links over AI-generated links that may merge
+            # separate left/right branches or hallucinate OCR debris.
+            if len(diagram_rows) >= 2:
+                rows = diagram_rows
 
             if not rows:
                 st.warning("No ownership links with clear percentages were identified. Check that the document contains readable ownership details.")
