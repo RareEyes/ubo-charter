@@ -13,11 +13,24 @@ SUPPORTED = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "eml"]
 
 
 def extract_text(uploaded_file):
+    """Extract ordinary text and OCR text from written/scanned documents."""
     import xml.etree.ElementTree as ET
     from zipfile import ZipFile
 
     ext = Path(uploaded_file.name).suffix.lower()
     raw = uploaded_file.getvalue()
+
+    def ocr_image_bytes(image_bytes):
+        try:
+            import pytesseract
+            from PIL import Image, ImageOps, ImageEnhance
+
+            image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            image = ImageOps.grayscale(image)
+            image = ImageEnhance.Contrast(image).enhance(1.5)
+            return pytesseract.image_to_string(image, config="--psm 6").strip()
+        except Exception:
+            return ""
 
     try:
         if ext == ".pdf":
@@ -28,9 +41,8 @@ def extract_text(uploaded_file):
 
             for page_num, page in enumerate(doc, start=1):
                 parts = []
-
-                # Extract selectable text and its coordinates.
-                for block in page.get_text("blocks", sort=True):
+                blocks = page.get_text("blocks", sort=True)
+                for block in blocks:
                     x0, y0, x1, y1, text = block[:5]
                     text = text.strip()
                     if text:
@@ -38,40 +50,29 @@ def extract_text(uploaded_file):
                             f"Position x={x0:.0f}, y={y0:.0f}: {text}"
                         )
 
-                # Try OCR when a page has no selectable text.
-                if not parts:
-                    try:
-                        import pytesseract
-                        from PIL import Image
-
-                        pix = page.get_pixmap(
-                            matrix=fitz.Matrix(2, 2), alpha=False
-                        )
-                        image = Image.frombytes(
-                            "RGB", [pix.width, pix.height], pix.samples
-                        )
-                        ocr_text = pytesseract.image_to_string(image).strip()
-
-                        if ocr_text:
-                            parts.append("OCR text:\n" + ocr_text)
-                    except Exception:
+                # OCR image-only/scanned pages and pages containing embedded
+                # images, where a diagram may contain additional labels.
+                has_images = bool(page.get_images(full=True))
+                if not parts or has_images:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+                    image_bytes = pix.tobytes("png")
+                    ocr_text = ocr_image_bytes(image_bytes)
+                    if ocr_text:
+                        parts.append("OCR text from page image:\n" + ocr_text)
+                    elif not parts:
                         parts.append(
-                            "No selectable text found. OCR is unavailable "
-                            "or not configured for this page."
+                            "No selectable text found and OCR was unavailable or found no text."
                         )
 
                 if parts:
-                    pages.append(
-                        f"[Page {page_num}]\n" + "\n".join(parts)
-                    )
+                    pages.append(f"[Page {page_num}]\n" + "\n".join(parts))
 
             return "\n\n".join(pages) or "No readable PDF text found."
 
         if ext == ".docx":
             with ZipFile(BytesIO(raw)) as archive:
-                root = ET.fromstring(
-                    archive.read("word/document.xml")
-                )
+                root = ET.fromstring(archive.read("word/document.xml"))
+                archive_names = archive.namelist()
 
             ns = {
                 "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -81,90 +82,77 @@ def extract_text(uploaded_file):
             body = root.find("w:body", ns)
             paragraphs = []
 
-            # Read ordinary paragraphs and table text, avoiding
-            # duplicate text from inside floating shapes.
             def read_normal_text(element):
                 tag = element.tag.split("}")[-1]
-
                 if tag in {"drawing", "pict", "txbxContent"}:
                     return ""
-
                 if tag == "t":
                     return element.text or ""
-
                 return "".join(read_normal_text(child) for child in element)
 
             def walk_body(element):
                 tag = element.tag.split("}")[-1]
-
                 if tag == "p":
                     text = read_normal_text(element).strip()
                     if text:
                         paragraphs.append(text)
                     return
-
                 if tag in {"drawing", "pict", "txbxContent"}:
                     return
-
                 for child in element:
                     walk_body(child)
 
             if body is not None:
                 walk_body(body)
 
-            # Read modern Word floating drawing shapes and text boxes.
             shapes = []
-
             for anchor in root.findall(".//wp:anchor", ns):
                 text = "\n".join(
                     "".join(t.text or "" for t in paragraph.findall(".//w:t", ns))
                     for paragraph in anchor.findall(".//w:txbxContent//w:p", ns)
                 ).strip()
-
-                # Some shapes contain text without a standard text box.
                 if not text:
                     text = "".join(
                         t.text or "" for t in anchor.findall(".//w:t", ns)
                     ).strip()
-
                 if not text:
                     continue
-
                 h = anchor.find("wp:positionH/wp:posOffset", ns)
                 v = anchor.find("wp:positionV/wp:posOffset", ns)
-
-                # Word coordinates use EMUs; 12,700 EMUs = 1 point.
                 x = round(int(h.text) / 12700, 1) if h is not None else None
                 y = round(int(v.text) / 12700, 1) if v is not None else None
-
                 shapes.append((y, x, text))
 
-            shapes.sort(
-                key=lambda item: (
-                    item[0] if item[0] is not None else float("inf"),
-                    item[1] if item[1] is not None else float("inf"),
-                )
-            )
+            shapes.sort(key=lambda item: (
+                item[0] if item[0] is not None else float("inf"),
+                item[1] if item[1] is not None else float("inf"),
+            ))
 
             result = []
-
             if paragraphs:
-                result.append(
-                    "Ordinary document text:\n" + "\n".join(paragraphs)
-                )
-
+                result.append("Ordinary document text:\n" + "\n".join(paragraphs))
             if shapes:
-                shape_lines = []
-                for y, x, text in shapes:
-                    shape_lines.append(
-                        f"Diagram shape (vertical offset={y}, "
-                        f"horizontal offset={x} points): {text}"
-                    )
-
                 result.append(
-                    "Floating diagram shapes, approximately top to bottom:\n"
-                    + "\n".join(shape_lines)
+                    "Diagram text boxes, approximately top to bottom:\n" +
+                    "\n".join(
+                        f"Diagram shape (vertical offset={y}, horizontal offset={x} points): {text}"
+                        for y, x, text in shapes
+                    )
                 )
+
+            # OCR images embedded in Word, including scanned pages or diagrams.
+            image_results = []
+            for name in archive_names:
+                if name.startswith("word/media/") and name.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+                ):
+                    with ZipFile(BytesIO(raw)) as archive:
+                        image_bytes = archive.read(name)
+                    ocr_text = ocr_image_bytes(image_bytes)
+                    if ocr_text:
+                        image_results.append(f"Embedded image ({Path(name).name}) OCR:\n{ocr_text}")
+            if image_results:
+                result.append("\n\n".join(image_results))
 
             return "\n\n".join(result) or "No readable Word text found."
 
