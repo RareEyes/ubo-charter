@@ -21,42 +21,85 @@ def extract_text(uploaded_file):
     raw = uploaded_file.getvalue()
 
     def ocr_image_bytes(image_bytes):
-        """Return OCR text with approximate word positions to help interpret diagrams."""
+        """OCR an image using full-page text plus overlapping strips for labels."""
         try:
             import pytesseract
             from PIL import Image, ImageOps, ImageEnhance
 
-            # Keep the original RGB image for OCR. On the ownership-chart PDF,
-            # grayscale preprocessing caused Tesseract to miss the top owner name.
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
-            data = pytesseract.image_to_data(
-                image, config="--psm 11", output_type=pytesseract.Output.DICT
-            )
             width, height = image.size
-            items = []
-            for i, word in enumerate(data["text"]):
-                word = str(word).strip()
-                if not word:
-                    continue
-                try:
-                    confidence = float(data["conf"][i])
-                except (TypeError, ValueError):
-                    confidence = -1
-                if confidence < 15:
-                    continue
-                x = int(data["left"][i] + data["width"][i] / 2)
-                y = int(data["top"][i] + data["height"][i] / 2)
-                items.append((y, x, word))
+            detections = []
 
-            if items:
-                items.sort()
+            # Full-page pass captures company names and percentage labels.
+            passes = [(image, 0, 0, width, height, "--psm 11")]
+            # Whole-page sparse OCR can miss text inside oval/rounded shapes.
+            # Overlapping strips make those labels easier to recognize while
+            # preserving their coordinates relative to the full page.
+            strip_h = int(height * 0.30)
+            for y0 in [int(height * 0.10), int(height * 0.20),
+                       int(height * 0.30), int(height * 0.40),
+                       int(height * 0.50), int(height * 0.60)]:
+                y1 = min(height, y0 + strip_h)
+                if y1 > y0:
+                    passes.append((image.crop((0, y0, width, y1)), 0, y0, width, height, "--psm 11"))
+
+            # Independently OCR the two common top-owner regions. This is
+            # particularly important when text sits inside oval/circular nodes.
+            y0, y1 = int(height * 0.20), int(height * 0.46)
+            for x0, x1 in [(0.05, 0.45), (0.55, 0.95)]:
+                left, right = int(width * x0), int(width * x1)
+                passes.append((
+                    image.crop((left, y0, right, y1)),
+                    left, y0, width, height, "--psm 11"
+                ))
+
+            seen = set()
+            for crop, offset_x, offset_y, full_w, full_h, config in passes:
+                data = pytesseract.image_to_data(
+                    crop, config=config, output_type=pytesseract.Output.DICT
+                )
+                for i, raw_word in enumerate(data["text"]):
+                    word = str(raw_word).strip()
+                    if not word:
+                        continue
+                    try:
+                        confidence = float(data["conf"][i])
+                    except (TypeError, ValueError):
+                        confidence = -1
+                    # Ignore low-confidence specks such as the spurious "es"
+                    # that Tesseract reads from the diagram border.
+                    if confidence < 45:
+                        continue
+                    left = int(data["left"][i]) + offset_x
+                    top = int(data["top"][i]) + offset_y
+                    w = int(data["width"][i])
+                    h = int(data["height"][i])
+                    x = left + w / 2
+                    y = top + h / 2
+                    nx, ny = x / max(width, 1), y / max(height, 1)
+                    key = (word.casefold(), round(nx, 2), round(ny, 2))
+                    # Overlapping OCR crops may recognize the same word with
+                    # slightly different spelling (e.g. Company/Companv).
+                    # Suppress duplicate detections at essentially the same spot.
+                    if key in seen or any(
+                        abs(existing_x / max(width, 1) - nx) < 0.012
+                        and abs(existing_y / max(height, 1) - ny) < 0.012
+                        for existing_y, existing_x, _ in detections
+                    ):
+                        continue
+                    seen.add(key)
+                    detections.append((y, x, word))
+
+            if detections:
+                detections.sort()
                 positioned = [
-                    f"{word} [x={x / max(width, 1):.2f}, y={y / max(height, 1):.2f}]"
-                    for y, x, word in items
+                    f"{word} [x={x / max(width, 1):.3f}, y={y / max(height, 1):.3f}]"
+                    for y, x, word in detections
                 ]
                 return "OCR words with normalized page positions (0=left/top, 1=right/bottom):\n" + "\n".join(positioned)
 
-            return pytesseract.image_to_string(image, config="--psm 3").strip()
+            # Last fallback for scanned pages if positioned OCR returns nothing.
+            return pytesseract.image_to_string(image, config="--psm 6").strip()
         except Exception:
             return ""
 
