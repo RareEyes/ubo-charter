@@ -673,6 +673,27 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
     return rows
 
 
+def calculate_ubo_totals_from_structure(owners_by_entity, structure_rows):
+    """Calculate terminal individual/entity ownership from the exact paths shown in the structure table."""
+    totals = {}
+    display_names = {}
+    for row in structure_rows:
+        owner = str(row.get("Shareholder / ownership", "")).strip()
+        owner_key = entity_key(owner)
+        # If this owner is itself an entity with shareholders, it is an intermediary,
+        # not a terminal owner. Its upstream owners will appear in deeper structure rows.
+        if not owner or owner_key in owners_by_entity:
+            continue
+        contribution_text = str(row.get("Ownership % in Current Company", "")).strip()
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)%", contribution_text)
+        if not match:
+            continue
+        contribution = float(match.group(1))
+        display_names.setdefault(owner_key, owner)
+        totals[owner_key] = totals.get(owner_key, 0.0) + contribution
+    return [(display_names[key], round(value, 4)) for key, value in totals.items()]
+
+
 if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads)):
     if not document_text.strip():
         st.error("No readable text could be extracted from the uploaded documents.")
@@ -880,8 +901,13 @@ SOURCE:
                 if entity_key(main_entity) not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
                 else:
+                    # Build the structure first, then derive the UBO summary from the
+                    # terminal ownership rows in that same structure. This prevents the
+                    # summary and structure from diverging when a graph path is extracted.
+                    structure_rows = build_ownership_structure(owners_by_entity, main_entity)
+                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
+
                     st.subheader("UBO Summary")
-                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
                     qualifying_ubos = sorted(
                         [(name, pct) for name, pct in ubo_totals if pct >= ownership_threshold],
                         key=lambda item: item[1], reverse=True,
@@ -894,7 +920,6 @@ SOURCE:
                         st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
 
                     st.subheader("Ownership Structure")
-                    structure_rows = build_ownership_structure(owners_by_entity, main_entity)
                     if structure_rows:
                         structure_df = pd.DataFrame(structure_rows)[[
                             "Entity", "Shareholder / ownership", "Ownership %",
