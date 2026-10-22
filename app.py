@@ -901,11 +901,12 @@ SOURCE:
                 if entity_key(main_entity) not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
                 else:
-                    # Build the ownership paths first, then derive the UBO Summary
-                    # from the terminal owners on those exact paths. This ensures the
-                    # summary uses the same graph that produced the visible structure.
+                    # Calculate effective ownership directly from the ownership graph.
+                    # Only terminal owners (owners with no further ownership links in the
+                    # extracted graph) are treated as ultimate owners for this prototype.
+                    # This avoids making the UBO Summary depend on the display table.
+                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
-                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
@@ -930,10 +931,12 @@ SOURCE:
                     }
                     qualifying_structure_rows = [
                         row for row in structure_rows
-                        if entity_key(str(row.get("Shareholder / ownership", "")).strip())
-                        not in owners_by_entity
-                        and entity_key(str(row.get("Shareholder / ownership", "")).strip())
-                        in qualifying_owner_keys
+                        if (
+                            entity_key(str(row.get("Shareholder / ownership", "")).strip())
+                            not in owners_by_entity
+                            and entity_key(str(row.get("Shareholder / ownership", "")).strip())
+                            in qualifying_owner_keys
+                        )
                     ]
                     if qualifying_structure_rows:
                         structure_df = pd.DataFrame(qualifying_structure_rows)[[
