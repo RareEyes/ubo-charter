@@ -643,6 +643,7 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
                 "Ownership % in Current Company": contribution,
                 "Total Ownership %": None,
                 "_depth": depth,
+                "_contribution": contribution,
             })
             owner_key = entity_key(owner)
             if owner_key in owners_by_entity and owner_key not in path_seen:
@@ -674,24 +675,32 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
 
 
 def calculate_ubo_totals_from_structure(owners_by_entity, structure_rows):
-    """Calculate terminal individual/entity ownership from the exact paths shown in the structure table."""
+    """Add up every path (direct and indirect) to each ultimate owner.
+
+    Returns a list of (name, direct %, indirect %, total %).
+    - Direct = the owner holds shares in the main entity itself (first layer).
+    - Indirect = the owner holds shares through one or more companies.
+    Owners that are companies with their own shareholders are intermediaries,
+    so their shareholders are counted instead.
+    """
     totals = {}
-    display_names = {}
     for row in structure_rows:
         owner = str(row.get("Shareholder / ownership", "")).strip()
         owner_key = entity_key(owner)
-        # If this owner is itself an entity with shareholders, it is an intermediary,
-        # not a terminal owner. Its upstream owners will appear in deeper structure rows.
         if not owner or owner_key in owners_by_entity:
             continue
-        contribution_text = str(row.get("Ownership % in Current Company", "")).strip()
-        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)%", contribution_text)
-        if not match:
+        contribution = row.get("_contribution")
+        if contribution is None:
             continue
-        contribution = float(match.group(1))
-        display_names.setdefault(owner_key, owner)
-        totals[owner_key] = totals.get(owner_key, 0.0) + contribution
-    return [(display_names[key], round(value, 4)) for key, value in totals.items()]
+        record = totals.setdefault(owner_key, {"name": owner, "direct": 0.0, "indirect": 0.0})
+        if row.get("_depth", 0) == 0:
+            record["direct"] += contribution
+        else:
+            record["indirect"] += contribution
+    return [
+        (r["name"], round(r["direct"], 4), round(r["indirect"], 4), round(r["direct"] + r["indirect"], 4))
+        for r in totals.values()
+    ]
 
 
 if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads)):
@@ -909,12 +918,23 @@ SOURCE:
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
-                        [(name, pct) for name, pct in ubo_totals if pct >= ownership_threshold],
-                        key=lambda item: item[1], reverse=True,
+                        [row for row in ubo_totals if row[3] + 1e-9 >= ownership_threshold],
+                        key=lambda item: item[3], reverse=True,
                     )
+
+                    def fmt_pct(value):
+                        return f"{value:.4f}".rstrip("0").rstrip(".") + "%" if value else "0%"
+
                     if qualifying_ubos:
-                        ubo_df = pd.DataFrame(qualifying_ubos, columns=["UBO", "Total Ownership Percentage"])
-                        ubo_df["Total Ownership Percentage"] = ubo_df["Total Ownership Percentage"].map(lambda value: f"{value:.4f}".rstrip("0").rstrip(".") + "%")
+                        ubo_df = pd.DataFrame([
+                            {
+                                "UBO": name,
+                                "Direct Ownership %": fmt_pct(direct),
+                                "Indirect Ownership %": fmt_pct(indirect),
+                                "Total Ownership Percentage": fmt_pct(total),
+                            }
+                            for name, direct, indirect, total in qualifying_ubos
+                        ])
                         st.dataframe(ubo_df, use_container_width=True, hide_index=True)
                     else:
                         st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
