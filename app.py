@@ -901,12 +901,11 @@ SOURCE:
                 if entity_key(main_entity) not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
                 else:
-                    # Calculate the UBO summary directly from the ownership graph,
-                    # recursively following intermediaries until terminal owners are reached.
-                    # Keep the display structure separate so display formatting cannot
-                    # affect the ownership calculations.
-                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
+                    # Build the ownership paths first, then derive the UBO Summary
+                    # from the terminal owners on those exact paths. This ensures the
+                    # summary uses the same graph that produced the visible structure.
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
+                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
