@@ -625,7 +625,7 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
-    """Show every direct and indirect ownership layer with path-based effective percentages."""
+    """Show direct ownership, path contribution to the main entity, and total contribution across appearances."""
     rows = []
     queue = [(main_entity.strip(), 0, 100.0, frozenset({entity_key(main_entity)}))]
 
@@ -633,53 +633,43 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
         entity, depth, entity_share_of_main, path_seen = queue.pop(0)
         if depth >= max_depth:
             continue
-
         direct_owners = owners_by_entity.get(entity_key(entity), [])
         for owner, pct in direct_owners:
-            owner_key = entity_key(owner)
-            contribution = entity_share_of_main * float(pct) / 100.0
-            is_intermediary = owner_key in owners_by_entity
+            contribution = entity_share_of_main * pct / 100.0
             rows.append({
                 "Entity": entity,
                 "Shareholder / ownership": owner,
-                "Ownership Level": "Direct owner" if depth == 0 else "Indirect owner",
-                "Ownership %": float(pct),
+                "Ownership %": pct,
                 "Ownership % in Current Company": contribution,
-                # For intermediary companies this is their path contribution. For
-                # ultimate owners, it is replaced below with the combined total
-                # across distinct valid paths (including direct + indirect paths).
-                "Total Ownership %": contribution,
+                "Total Ownership %": None,
                 "_depth": depth,
-                "_is_intermediary": is_intermediary,
             })
-            if is_intermediary and owner_key not in path_seen:
+            owner_key = entity_key(owner)
+            if owner_key in owners_by_entity and owner_key not in path_seen:
                 queue.append((owner, depth + 1, contribution, path_seen | {owner_key}))
 
-    # Aggregate only terminal owners' effective ownership across paths. Do not add
-    # an intermediary company's percentage to the percentages of its shareholders.
-    terminal_totals = {}
+    # Aggregate each shareholder/entity's effective contributions across every row where
+    # its name appears. Keep the path-specific contribution in the preceding column.
+    total_by_owner = {}
+    display_by_owner = {}
     for row in rows:
-        owner_key = entity_key(row["Shareholder / ownership"])
-        if not row["_is_intermediary"]:
-            terminal_totals[owner_key] = terminal_totals.get(owner_key, 0.0) + row["Ownership % in Current Company"]
-
+        owner = row["Shareholder / ownership"]
+        key = entity_key(owner)
+        total_by_owner[key] = total_by_owner.get(key, 0.0) + row["Ownership % in Current Company"]
+        display_by_owner.setdefault(key, owner)
     for row in rows:
-        owner_key = entity_key(row["Shareholder / ownership"])
-        if not row["_is_intermediary"]:
-            row["Total Ownership %"] = terminal_totals.get(owner_key, row["Ownership % in Current Company"])
+        key = entity_key(row["Shareholder / ownership"])
         row["Ownership %"] = f"{row['Ownership %']:g}%"
         row["Ownership % in Current Company"] = f"{row['Ownership % in Current Company']:.4f}".rstrip("0").rstrip(".") + "%"
-        row["Total Ownership %"] = f"{row['Total Ownership %']:.4f}".rstrip("0").rstrip(".") + "%"
-        row.pop("_is_intermediary", None)
+        row["Total Ownership %"] = f"{total_by_owner[key]:.4f}".rstrip("0").rstrip(".") + "%"
 
-    # Keep each entity label on its first row, matching the existing table layout.
+    # Keep each entity label on its first row, matching the requested example layout.
     previous_entity = None
     for row in rows:
         if row["Entity"] == previous_entity:
             row["Entity"] = ""
         else:
             previous_entity = row["Entity"]
-        row.pop("_depth", None)
     return rows
 
 
@@ -725,7 +715,7 @@ Rules:
 - For the common ownership-chart layout used in these documents, the company being analysed is at the top and its shareholders are in boxes below it, with arrows pointing DOWN from the company to each shareholder. In this layout, the LOWER box is the owner/shareholder and the UPPER box is the owned entity. For example, ABC Pvt Ltd at the top with XYZ LLC below and 40% beside the connecting downward arrow means XYZ LLC owns 40% of ABC Pvt Ltd.
 - Repeat this rule at every layer: if Myrah Company is below ABC Pvt Ltd, and Masiha Ltd and Wiqas LLC are below Myrah Company, then Myrah Company owns part of ABC Pvt Ltd while Masiha Ltd and Wiqas LLC own parts of Myrah Company.
 - Follow the visible arrow direction when it is clear. Do not reverse ownership links based only on which label appears first in extracted text. A percentage label beside a connecting branch applies to that direct owner-to-entity link.
-- Extract every supported link across ALL layers, including shareholders of intermediate holding companies, not just shareholders of the main entity. For every company box, identify its own direct shareholders and percentages. Do not stop at the first layer. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship. Keep the JSON compact; omit evidence and explanations.
+- Extract every supported link across all layers. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship. Keep the JSON compact; omit evidence and explanations.
 - OCR text may include normalized coordinates x and y (0 to 1). Smaller y means nearer the top of the page. Use these positions to distinguish labels belonging to different levels of a diagram.
 - Never invent names, percentages, or unsupported relationships. Do not calculate indirect percentages.
 - Return an empty array only if no direct ownership links are supported.
@@ -737,7 +727,7 @@ DOCUMENT TEXT:
             with st.spinner("Extracting ownership links and calculating results..."):
                 response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=4000,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Extract ownership data accurately and return valid JSON only."},
                         {"role": "user", "content": build_model_content(prompt, visual_images)},
@@ -769,13 +759,13 @@ DOCUMENT TEXT:
                 result = parse_ownership_json(result_text)
             except json.JSONDecodeError:
                 # Retry once with a shorter instruction and a compact JSON-only response.
-                retry_prompt = f"""Extract ALL direct ownership links from every layer in the source below, including owners of intermediate holding companies. The company at the top of a typical chart is the owned entity; lower connected shareholder boxes own the percentages shown beside their branches. Follow every layer and do not stop at the main entity's direct shareholders. Return ONLY compact valid JSON, no markdown, with this exact shape: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. Do not include explanations or evidence fields. Do not calculate indirect percentages. Never invent links.
+                retry_prompt = f"""Extract ALL direct ownership links from the source below. The company at the top of a typical chart is the owned entity; lower connected shareholder boxes own the percentages shown beside their branches. Follow every layer. Return ONLY compact valid JSON, no markdown, with this exact shape: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. Do not include explanations or evidence fields. Do not calculate indirect percentages. Never invent links.
 
 SOURCE:
 {document_text[:35000]}"""
                 retry_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=4000,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Return a single valid JSON object only."},
                         {"role": "user", "content": build_model_content(retry_prompt, visual_images)},
@@ -807,13 +797,13 @@ SOURCE:
                 and diagram_pct_count >= 3
                 and len(current_links) < minimum_expected_links
             ):
-                completeness_prompt = f"""Extract every direct ownership link in every layer of this MULTI-LAYER OWNERSHIP DIAGRAM, including shareholders of intermediate companies. The company at the top is the owned entity; connected shareholder boxes below it own the percentages shown beside their branches. Continue through every lower layer; do not return only the main company's direct shareholders. The source contains about {diagram_pct_count} separate percentage labels, so check that each label is assigned to the correct connected owner and entity. Return ONLY compact valid JSON: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. No explanations, no markdown, no indirect calculations, and do not invent links.
+                completeness_prompt = f"""Extract every direct ownership link in this MULTI-LAYER OWNERSHIP DIAGRAM. The company at the top is the owned entity; connected shareholder boxes below it own the percentages shown beside their branches. Continue through every lower layer. The source contains about {diagram_pct_count} separate percentage labels, so check that each label is assigned to the correct connected owner and entity. Return ONLY compact valid JSON: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. No explanations, no markdown, no indirect calculations, and do not invent links.
 
 SOURCE:
 {document_text[:35000]}"""
                 completeness_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=4000,
+                    max_tokens=800,
                     messages=[
                         {"role": "system", "content": "Return a complete direct-ownership graph as one valid JSON object only."},
                         {"role": "user", "content": build_model_content(completeness_prompt, visual_images)},
@@ -881,8 +871,8 @@ SOURCE:
                 seen_normalized = set()
                 for row in rows:
                     key = (
-                        entity_key(row["Owner / shareholder"]),
-                        entity_key(row["Owned entity"]),
+                        row["Owner / shareholder"].casefold(),
+                        row["Owned entity"].casefold(),
                         round(float(row["Direct ownership (%)"]), 4),
                     )
                     if key not in seen_normalized:
@@ -890,24 +880,15 @@ SOURCE:
                         normalized_rows.append(row)
                 rows = normalized_rows
                 owners_by_entity = build_ownership_map(rows)
-                # Flag impossible ownership totals without rejecting legitimate partial ownership data.
-                for entity_id, owner_links in owners_by_entity.items():
-                    pct_total = sum(pct for _, pct in owner_links)
-                    if pct_total > 100.01:
-                        entity_display = next((r["Owned entity"] for r in rows if entity_key(r["Owned entity"]) == entity_id), entity_id)
-                        st.warning(
-                            f"Extracted direct ownership for **{entity_display}** totals {pct_total:.2f}%, "
-                            "which exceeds 100%. Verify the extracted links before relying on the UBO result."
-                        )
                 main_entity = main_entity_input.strip()
                 if not main_entity:
                     # The main entity is normally the owned entity that is never
                     # itself listed as a shareholder/owner in the extracted graph.
-                    owner_names = {entity_key(row["Owner / shareholder"]) for row in rows}
+                    owner_names = {row["Owner / shareholder"].strip().casefold() for row in rows}
                     candidates = []
                     for row in rows:
                         entity = row["Owned entity"].strip()
-                        if entity and entity_key(entity) not in owner_names and entity_key(entity) not in [entity_key(c) for c in candidates]:
+                        if entity and entity.casefold() not in owner_names and entity.casefold() not in [c.casefold() for c in candidates]:
                             candidates.append(entity)
                     main_entity = candidates[0] if candidates else rows[0]["Owned entity"].strip()
                     st.info(f"Main Entity inferred from the document: **{main_entity}**")
@@ -924,7 +905,7 @@ SOURCE:
                     # from the terminal owners on those exact paths. This ensures the
                     # summary uses the same graph that produced the visible structure.
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
-                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
+                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
@@ -939,14 +920,31 @@ SOURCE:
                         st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
 
                     st.subheader("Ownership Structure")
-                    if structure_rows:
-                        structure_df = pd.DataFrame(structure_rows)[[
-                            "Entity", "Shareholder / ownership", "Ownership Level",
-                            "Ownership %", "Ownership % in Current Company", "Total Ownership %"
+                    # Show only terminal owners who meet the configured threshold.
+                    # Companies/intermediaries are excluded; their ownership is traced
+                    # through to the individuals at the end of each ownership path.
+                    qualifying_owner_keys = {
+                        entity_key(name)
+                        for name, pct in ubo_totals
+                        if pct >= ownership_threshold
+                    }
+                    qualifying_structure_rows = [
+                        row for row in structure_rows
+                        if entity_key(str(row.get("Shareholder / ownership", "")).strip())
+                        not in owners_by_entity
+                        and entity_key(str(row.get("Shareholder / ownership", "")).strip())
+                        in qualifying_owner_keys
+                    ]
+                    if qualifying_structure_rows:
+                        structure_df = pd.DataFrame(qualifying_structure_rows)[[
+                            "Entity", "Shareholder / ownership", "Ownership %",
+                            "Ownership % in Current Company", "Total Ownership %"
                         ]]
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
-                        st.info("No ownership structure could be built from the extracted links.")
+                        st.info(
+                            f"No individual ultimate owners meet the {ownership_threshold:g}% ownership threshold."
+                        )
                     st.caption("Verify all extracted links against the source documents. Ownership calculations are path-based and do not determine legal UBO status or control.")
         except KeyError:
             st.error("GROQ_API_KEY is missing from Streamlit Secrets.")
