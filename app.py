@@ -575,6 +575,16 @@ with settings_col2:
     )
 
 
+def entity_key(value):
+    """Normalize names consistently so invisible characters/punctuation do not break ownership chains."""
+    import unicodedata
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    # Remove zero-width formatting characters, normalize whitespace, and compare
+    # the meaningful letters/digits rather than punctuation or spacing variants.
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
 def build_ownership_map(edges):
     owners_by_entity = {}
     for row in edges:
@@ -584,8 +594,9 @@ def build_ownership_map(edges):
             pct = float(row.get("Direct ownership (%)"))
         except (TypeError, ValueError):
             continue
-        if owner and entity and 0 <= pct <= 100:
-            owners_by_entity.setdefault(entity.casefold(), []).append((owner, pct))
+        key = entity_key(entity)
+        if owner and key and 0 <= pct <= 100:
+            owners_by_entity.setdefault(key, []).append((owner, pct))
     return owners_by_entity
 
 
@@ -596,31 +607,33 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
     def walk(entity, product, seen, depth):
         if depth >= max_depth:
             return
-        for owner, pct in owners_by_entity.get(entity.casefold(), []):
-            owner_key = owner.casefold()
-            if owner_key in seen:
+        entity_lookup = entity_key(entity)
+        for owner, pct in owners_by_entity.get(entity_lookup, []):
+            owner_lookup = entity_key(owner)
+            if owner_lookup in seen:
                 continue
             contribution = product * pct / 100.0
-            if owner_key in owners_by_entity:
-                walk(owner, contribution, seen | {owner_key}, depth + 1)
+            if owner_lookup in owners_by_entity:
+                walk(owner, contribution, seen | {owner_lookup}, depth + 1)
             else:
-                display_names.setdefault(owner_key, owner)
-                totals[owner_key] = totals.get(owner_key, 0.0) + contribution
+                display_names.setdefault(owner_lookup, owner.strip())
+                totals[owner_lookup] = totals.get(owner_lookup, 0.0) + contribution
 
-    walk(main_entity.strip(), 100.0, {main_entity.strip().casefold()}, 0)
+    main_key = entity_key(main_entity)
+    walk(main_entity.strip(), 100.0, {main_key}, 0)
     return [(display_names[k], round(v, 4)) for k, v in totals.items()]
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
     """Show direct ownership, path contribution to the main entity, and total contribution across appearances."""
     rows = []
-    queue = [(main_entity.strip(), 0, 100.0, frozenset({main_entity.strip().casefold()}))]
+    queue = [(main_entity.strip(), 0, 100.0, frozenset({entity_key(main_entity)}))]
 
     while queue:
         entity, depth, entity_share_of_main, path_seen = queue.pop(0)
         if depth >= max_depth:
             continue
-        direct_owners = owners_by_entity.get(entity.casefold(), [])
+        direct_owners = owners_by_entity.get(entity_key(entity), [])
         for owner, pct in direct_owners:
             contribution = entity_share_of_main * pct / 100.0
             rows.append({
@@ -631,7 +644,7 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
                 "Total Ownership %": None,
                 "_depth": depth,
             })
-            owner_key = owner.casefold()
+            owner_key = entity_key(owner)
             if owner_key in owners_by_entity and owner_key not in path_seen:
                 queue.append((owner, depth + 1, contribution, path_seen | {owner_key}))
 
@@ -641,14 +654,14 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
     display_by_owner = {}
     for row in rows:
         owner = row["Shareholder / ownership"]
-        key = owner.casefold()
+        key = entity_key(owner)
         total_by_owner[key] = total_by_owner.get(key, 0.0) + row["Ownership % in Current Company"]
         display_by_owner.setdefault(key, owner)
     for row in rows:
-        key = row["Shareholder / ownership"].casefold()
+        key = entity_key(row["Shareholder / ownership"])
         row["Ownership %"] = f"{row['Ownership %']:g}%"
-        row["Ownership % in Current Company"] = f"{row['Ownership % in Current Company']:g}%"
-        row["Total Ownership %"] = f"{total_by_owner[key]:g}%"
+        row["Ownership % in Current Company"] = f"{row['Ownership % in Current Company']:.4f}".rstrip("0").rstrip(".") + "%"
+        row["Total Ownership %"] = f"{total_by_owner[key]:.4f}".rstrip("0").rstrip(".") + "%"
 
     # Keep each entity label on its first row, matching the requested example layout.
     previous_entity = None
@@ -864,7 +877,7 @@ SOURCE:
                         "", main_entity
                     ).strip()
 
-                if main_entity.casefold() not in owners_by_entity:
+                if entity_key(main_entity) not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
                 else:
                     st.subheader("UBO Summary")
@@ -875,7 +888,7 @@ SOURCE:
                     )
                     if qualifying_ubos:
                         ubo_df = pd.DataFrame(qualifying_ubos, columns=["UBO", "Total Ownership Percentage"])
-                        ubo_df["Total Ownership Percentage"] = ubo_df["Total Ownership Percentage"].map(lambda value: f"{value:g}%")
+                        ubo_df["Total Ownership Percentage"] = ubo_df["Total Ownership Percentage"].map(lambda value: f"{value:.4f}".rstrip("0").rstrip(".") + "%")
                         st.dataframe(ubo_df, use_container_width=True, hide_index=True)
                     else:
                         st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
