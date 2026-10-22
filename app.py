@@ -727,7 +727,7 @@ DOCUMENT TEXT:
             with st.spinner("Extracting ownership links and calculating results..."):
                 response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=800,
+                    max_tokens=4000,
                     messages=[
                         {"role": "system", "content": "Extract ownership data accurately and return valid JSON only."},
                         {"role": "user", "content": build_model_content(prompt, visual_images)},
@@ -765,7 +765,7 @@ SOURCE:
 {document_text[:35000]}"""
                 retry_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=800,
+                    max_tokens=4000,
                     messages=[
                         {"role": "system", "content": "Return a single valid JSON object only."},
                         {"role": "user", "content": build_model_content(retry_prompt, visual_images)},
@@ -803,7 +803,7 @@ SOURCE:
 {document_text[:35000]}"""
                 completeness_response = client.chat.completions.create(
                     model="qwen/qwen3.8-27b",
-                    max_tokens=800,
+                    max_tokens=4000,
                     messages=[
                         {"role": "system", "content": "Return a complete direct-ownership graph as one valid JSON object only."},
                         {"role": "user", "content": build_model_content(completeness_prompt, visual_images)},
@@ -871,8 +871,8 @@ SOURCE:
                 seen_normalized = set()
                 for row in rows:
                     key = (
-                        row["Owner / shareholder"].casefold(),
-                        row["Owned entity"].casefold(),
+                        entity_key(row["Owner / shareholder"]),
+                        entity_key(row["Owned entity"]),
                         round(float(row["Direct ownership (%)"]), 4),
                     )
                     if key not in seen_normalized:
@@ -880,15 +880,24 @@ SOURCE:
                         normalized_rows.append(row)
                 rows = normalized_rows
                 owners_by_entity = build_ownership_map(rows)
+                # Flag impossible ownership totals without rejecting legitimate partial ownership data.
+                for entity_id, owner_links in owners_by_entity.items():
+                    pct_total = sum(pct for _, pct in owner_links)
+                    if pct_total > 100.01:
+                        entity_display = next((r["Owned entity"] for r in rows if entity_key(r["Owned entity"]) == entity_id), entity_id)
+                        st.warning(
+                            f"Extracted direct ownership for **{entity_display}** totals {pct_total:.2f}%, "
+                            "which exceeds 100%. Verify the extracted links before relying on the UBO result."
+                        )
                 main_entity = main_entity_input.strip()
                 if not main_entity:
                     # The main entity is normally the owned entity that is never
                     # itself listed as a shareholder/owner in the extracted graph.
-                    owner_names = {row["Owner / shareholder"].strip().casefold() for row in rows}
+                    owner_names = {entity_key(row["Owner / shareholder"]) for row in rows}
                     candidates = []
                     for row in rows:
                         entity = row["Owned entity"].strip()
-                        if entity and entity.casefold() not in owner_names and entity.casefold() not in [c.casefold() for c in candidates]:
+                        if entity and entity_key(entity) not in owner_names and entity_key(entity) not in [entity_key(c) for c in candidates]:
                             candidates.append(entity)
                     main_entity = candidates[0] if candidates else rows[0]["Owned entity"].strip()
                     st.info(f"Main Entity inferred from the document: **{main_entity}**")
@@ -905,7 +914,7 @@ SOURCE:
                     # from the terminal owners on those exact paths. This ensures the
                     # summary uses the same graph that produced the visible structure.
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
-                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
+                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
