@@ -759,14 +759,122 @@ with settings_col2:
     )
 
 
-def entity_key(value):
-    """Normalize names consistently so invisible characters/punctuation do not break ownership chains."""
+_NAME_SYNONYMS = {
+    "limited": "ltd", "private": "pvt", "company": "co", "corporation": "corp",
+    "incorporated": "inc", "partners": "partner", "holdings": "holding",
+    "investments": "investment",
+}
+_COMPANY_WORDS = {
+    "ltd", "llc", "inc", "pvt", "corp", "co", "plc", "fze", "fzco", "fzc", "gmbh",
+    "bv", "nv", "lp", "llp", "pjsc", "psc", "trust", "foundation", "fund", "holding",
+    "group", "bank", "partner", "partnership", "est", "establishment", "anstalt",
+    "sarl", "srl", "spa", "pte", "pty", "sas", "investment", "capital", "ventures",
+    "enterprises", "sa", "ag",
+}
+
+
+def name_tokens(value):
+    """Break a name into normalized words so 'XYZ Limited' and 'XYZ L.L.C.' style variants line up."""
     import unicodedata
     value = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    # Remove zero-width formatting characters, normalize whitespace, and compare
-    # the meaningful letters/digits rather than punctuation or spacing variants.
     value = value.replace("\u200b", "").replace("\ufeff", "")
-    return re.sub(r"[^a-z0-9]+", "", value)
+    value = value.replace("&", " and ").replace(".", "").replace("'", "").replace("\u2019", "")
+    value = re.sub(r"limited liability (company|co)", "llc", value)
+    value = re.sub(r"public limited (company|co)", "plc", value)
+    tokens = [_NAME_SYNONYMS.get(t, t) for t in re.findall(r"[a-z0-9]+", value)]
+    if len(tokens) > 1 and tokens[0] == "the":
+        tokens = tokens[1:]
+    return tokens
+
+
+def entity_key(value):
+    """Normalize names consistently so punctuation, spacing and legal-form spelling do not break ownership chains."""
+    return "".join(name_tokens(value))
+
+
+def looks_like_company(name):
+    """True if the name looks like a company/legal entity rather than a person."""
+    tokens = name_tokens(name)
+    for position, token in enumerate(tokens):
+        if token in _COMPANY_WORDS and not (token in {"sa", "ag", "co"} and position == 0):
+            return True
+    return False
+
+
+def unify_similar_names(rows):
+    """Treat spelling variants of the same name (across documents) as one party.
+
+    Returns (rows with one agreed spelling per party, list of (variant, agreed name)).
+    Only near-identical names are merged (same legal-form words and numbers, ~93% similar).
+    """
+    import difflib
+    counts = {}
+    for row in rows:
+        for field in ("Owner / shareholder", "Owned entity"):
+            name = str(row[field]).strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+
+    def profile(name):
+        tokens = name_tokens(name)
+        return {
+            "key": "".join(tokens),
+            "sorted": " ".join(sorted(tokens)),
+            "legal": frozenset(t for t in tokens if t in _COMPANY_WORDS),
+            "numbers": frozenset(t for t in tokens if t.isdigit() or re.fullmatch(r"[ivx]+", t)),
+        }
+
+    groups = []
+    for name in sorted(counts, key=lambda n: (-counts[n], -len(n))):
+        prof = profile(name)
+        target = None
+        for group in groups:
+            gp = group["profile"]
+            if gp["key"] == prof["key"]:
+                target = group
+                break
+            if (
+                len(gp["key"]) >= 6 and len(prof["key"]) >= 6
+                and gp["legal"] == prof["legal"] and gp["numbers"] == prof["numbers"]
+                and difflib.SequenceMatcher(None, gp["sorted"], prof["sorted"]).ratio() >= 0.93
+            ):
+                target = group
+                break
+        if target is None:
+            groups.append({"profile": prof, "names": [name]})
+        else:
+            target["names"].append(name)
+
+    mapping, merges = {}, []
+    for group in groups:
+        rep = max(group["names"], key=lambda n: (counts[n], len(n)))
+        for name in group["names"]:
+            mapping[name] = rep
+            if name != rep:
+                merges.append((name, rep))
+
+    new_rows = []
+    for row in rows:
+        row = dict(row)
+        for field in ("Owner / shareholder", "Owned entity"):
+            name = str(row[field]).strip()
+            row[field] = mapping.get(name, name)
+        new_rows.append(row)
+    return new_rows, merges
+
+
+def dedupe_links(rows):
+    """Keep one copy of the same ownership link reported by several documents (avoids double counting)."""
+    kept, seen, conflicts = [], {}, []
+    for row in rows:
+        key = (entity_key(row["Owner / shareholder"]), entity_key(row["Owned entity"]))
+        pct = float(row["Direct ownership (%)"])
+        if key not in seen:
+            seen[key] = pct
+            kept.append(row)
+        elif abs(seen[key] - pct) > 1e-6:
+            conflicts.append((row["Owner / shareholder"], row["Owned entity"], seen[key], pct))
+    return kept, conflicts
 
 
 def build_ownership_map(edges):
@@ -1064,30 +1172,20 @@ if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads))
                             r"(?i)^position\s+x\s*=\s*[-\d.]+\s*,\s*y\s*=\s*[-\d.]+\s*:\s*",
                             "", str(row[field])
                         ).strip()
-                # Normalize and deduplicate after cleaning prefixes, because the
-                # AI and OCR parser may describe the same link with different labels.
-                normalized_rows = []
-                seen_normalized = set()
-                for row in rows:
-                    key = (
-                        row["Owner / shareholder"].casefold(),
-                        row["Owned entity"].casefold(),
-                        round(float(row["Direct ownership (%)"]), 4),
-                    )
-                    if key not in seen_normalized:
-                        seen_normalized.add(key)
-                        normalized_rows.append(row)
-                rows = normalized_rows
+                # Join the documents together: treat spelling variants of the same
+                # person/company as one party, then drop repeated links.
+                rows, name_merges = unify_similar_names(rows)
+                rows, link_conflicts = dedupe_links(rows)
                 owners_by_entity = build_ownership_map(rows)
                 main_entity = main_entity_input.strip()
                 if not main_entity:
                     # The main entity is normally the owned entity that is never
                     # itself listed as a shareholder/owner in the extracted graph.
-                    owner_names = {row["Owner / shareholder"].strip().casefold() for row in rows}
+                    owner_keys = {entity_key(row["Owner / shareholder"]) for row in rows}
                     candidates = []
                     for row in rows:
                         entity = row["Owned entity"].strip()
-                        if entity and entity.casefold() not in owner_names and entity.casefold() not in [c.casefold() for c in candidates]:
+                        if entity and entity_key(entity) not in owner_keys and entity_key(entity) not in [entity_key(c) for c in candidates]:
                             candidates.append(entity)
                     main_entity = candidates[0] if candidates else rows[0]["Owned entity"].strip()
                     st.info(f"Main Entity inferred from the document: **{main_entity}**")
@@ -1107,8 +1205,16 @@ if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads))
                     ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
 
                     st.subheader("UBO Summary")
+                    # Only individuals can be UBOs. Companies at the end of a chain mean
+                    # that the document showing who owns them is missing (or named differently).
+                    individuals = [row for row in ubo_totals if not looks_like_company(row[0])]
+                    end_companies = [row for row in ubo_totals if looks_like_company(row[0])]
                     qualifying_ubos = sorted(
-                        [row for row in ubo_totals if row[3] + 1e-9 >= ownership_threshold],
+                        [row for row in individuals if row[3] + 1e-9 >= ownership_threshold],
+                        key=lambda item: item[3], reverse=True,
+                    )
+                    unresolved_companies = sorted(
+                        [row for row in end_companies if row[3] + 1e-9 >= ownership_threshold],
                         key=lambda item: item[3], reverse=True,
                     )
 
@@ -1127,7 +1233,34 @@ if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads))
                         ])
                         st.dataframe(ubo_df, use_container_width=True, hide_index=True)
                     else:
-                        st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
+                        st.info(f"No individual owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
+
+                    if unresolved_companies:
+                        st.warning(
+                            "These companies hold a share at the end of the chain, but no owners were found for them, "
+                            "so the individuals behind them cannot be identified yet. Upload the document that shows "
+                            "who owns them, or check that the company name is written the same way in both documents."
+                        )
+                        def core_name(value):
+                            return "".join(t for t in name_tokens(value) if t not in _COMPANY_WORDS)
+
+                        def possible_match(company):
+                            core = core_name(company)
+                            found = sorted({
+                                row["Owned entity"] for row in rows
+                                if core and core_name(row["Owned entity"]) == core
+                                and entity_key(row["Owned entity"]) != entity_key(company)
+                            })
+                            return ", ".join(found)
+
+                        st.dataframe(pd.DataFrame([
+                            {
+                                "Company with unknown owners": name,
+                                "Total Ownership %": fmt_pct(total),
+                                "Possible match in your documents": possible_match(name),
+                            }
+                            for name, direct, indirect, total in unresolved_companies
+                        ]), use_container_width=True, hide_index=True)
 
                     st.subheader("Ownership Structure")
                     if structure_rows:
@@ -1138,6 +1271,16 @@ if st.button("Generate UBO Results", type="primary", disabled=not bool(uploads))
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No ownership structure could be built from the extracted links.")
+                    if name_merges:
+                        with st.expander(f"Names treated as the same party across documents ({len(name_merges)})"):
+                            st.dataframe(pd.DataFrame(
+                                [{"Name found": a, "Treated as": b} for a, b in name_merges]
+                            ), use_container_width=True, hide_index=True)
+                    if link_conflicts:
+                        st.warning(
+                            "The same ownership link had different percentages in different documents. The first one found was used: "
+                            + "; ".join(f"{o} in {e}: {kept:g}% (also seen as {other:g}%)" for o, e, kept, other in link_conflicts)
+                        )
                     st.caption("Verify all extracted links against the source documents. Ownership calculations are path-based and do not determine legal UBO status or control.")
         except KeyError:
             st.error("GROQ_API_KEY is missing from Streamlit Secrets.")
