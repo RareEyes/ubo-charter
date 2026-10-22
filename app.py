@@ -625,7 +625,7 @@ def calculate_ubo_totals(owners_by_entity, main_entity, max_depth=30):
 
 
 def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
-    """Show direct ownership, path contribution to the main entity, and total contribution across appearances."""
+    """Show every direct and indirect ownership layer with path-based effective percentages."""
     rows = []
     queue = [(main_entity.strip(), 0, 100.0, frozenset({entity_key(main_entity)}))]
 
@@ -633,43 +633,53 @@ def build_ownership_structure(owners_by_entity, main_entity, max_depth=30):
         entity, depth, entity_share_of_main, path_seen = queue.pop(0)
         if depth >= max_depth:
             continue
+
         direct_owners = owners_by_entity.get(entity_key(entity), [])
         for owner, pct in direct_owners:
-            contribution = entity_share_of_main * pct / 100.0
+            owner_key = entity_key(owner)
+            contribution = entity_share_of_main * float(pct) / 100.0
+            is_intermediary = owner_key in owners_by_entity
             rows.append({
                 "Entity": entity,
                 "Shareholder / ownership": owner,
-                "Ownership %": pct,
+                "Ownership Level": "Direct owner" if depth == 0 else "Indirect owner",
+                "Ownership %": float(pct),
                 "Ownership % in Current Company": contribution,
-                "Total Ownership %": None,
+                # For intermediary companies this is their path contribution. For
+                # ultimate owners, it is replaced below with the combined total
+                # across distinct valid paths (including direct + indirect paths).
+                "Total Ownership %": contribution,
                 "_depth": depth,
+                "_is_intermediary": is_intermediary,
             })
-            owner_key = entity_key(owner)
-            if owner_key in owners_by_entity and owner_key not in path_seen:
+            if is_intermediary and owner_key not in path_seen:
                 queue.append((owner, depth + 1, contribution, path_seen | {owner_key}))
 
-    # Aggregate each shareholder/entity's effective contributions across every row where
-    # its name appears. Keep the path-specific contribution in the preceding column.
-    total_by_owner = {}
-    display_by_owner = {}
+    # Aggregate only terminal owners' effective ownership across paths. Do not add
+    # an intermediary company's percentage to the percentages of its shareholders.
+    terminal_totals = {}
     for row in rows:
-        owner = row["Shareholder / ownership"]
-        key = entity_key(owner)
-        total_by_owner[key] = total_by_owner.get(key, 0.0) + row["Ownership % in Current Company"]
-        display_by_owner.setdefault(key, owner)
+        owner_key = entity_key(row["Shareholder / ownership"])
+        if not row["_is_intermediary"]:
+            terminal_totals[owner_key] = terminal_totals.get(owner_key, 0.0) + row["Ownership % in Current Company"]
+
     for row in rows:
-        key = entity_key(row["Shareholder / ownership"])
+        owner_key = entity_key(row["Shareholder / ownership"])
+        if not row["_is_intermediary"]:
+            row["Total Ownership %"] = terminal_totals.get(owner_key, row["Ownership % in Current Company"])
         row["Ownership %"] = f"{row['Ownership %']:g}%"
         row["Ownership % in Current Company"] = f"{row['Ownership % in Current Company']:.4f}".rstrip("0").rstrip(".") + "%"
-        row["Total Ownership %"] = f"{total_by_owner[key]:.4f}".rstrip("0").rstrip(".") + "%"
+        row["Total Ownership %"] = f"{row['Total Ownership %']:.4f}".rstrip("0").rstrip(".") + "%"
+        row.pop("_is_intermediary", None)
 
-    # Keep each entity label on its first row, matching the requested example layout.
+    # Keep each entity label on its first row, matching the existing table layout.
     previous_entity = None
     for row in rows:
         if row["Entity"] == previous_entity:
             row["Entity"] = ""
         else:
             previous_entity = row["Entity"]
+        row.pop("_depth", None)
     return rows
 
 
@@ -715,7 +725,7 @@ Rules:
 - For the common ownership-chart layout used in these documents, the company being analysed is at the top and its shareholders are in boxes below it, with arrows pointing DOWN from the company to each shareholder. In this layout, the LOWER box is the owner/shareholder and the UPPER box is the owned entity. For example, ABC Pvt Ltd at the top with XYZ LLC below and 40% beside the connecting downward arrow means XYZ LLC owns 40% of ABC Pvt Ltd.
 - Repeat this rule at every layer: if Myrah Company is below ABC Pvt Ltd, and Masiha Ltd and Wiqas LLC are below Myrah Company, then Myrah Company owns part of ABC Pvt Ltd while Masiha Ltd and Wiqas LLC own parts of Myrah Company.
 - Follow the visible arrow direction when it is clear. Do not reverse ownership links based only on which label appears first in extracted text. A percentage label beside a connecting branch applies to that direct owner-to-entity link.
-- Extract every supported link across all layers. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship. Keep the JSON compact; omit evidence and explanations.
+- Extract every supported link across ALL layers, including shareholders of intermediate holding companies, not just shareholders of the main entity. For every company box, identify its own direct shareholders and percentages. Do not stop at the first layer. Do not connect a percentage to the nearest name unless the layout/branch supports that relationship. Keep the JSON compact; omit evidence and explanations.
 - OCR text may include normalized coordinates x and y (0 to 1). Smaller y means nearer the top of the page. Use these positions to distinguish labels belonging to different levels of a diagram.
 - Never invent names, percentages, or unsupported relationships. Do not calculate indirect percentages.
 - Return an empty array only if no direct ownership links are supported.
@@ -759,7 +769,7 @@ DOCUMENT TEXT:
                 result = parse_ownership_json(result_text)
             except json.JSONDecodeError:
                 # Retry once with a shorter instruction and a compact JSON-only response.
-                retry_prompt = f"""Extract ALL direct ownership links from the source below. The company at the top of a typical chart is the owned entity; lower connected shareholder boxes own the percentages shown beside their branches. Follow every layer. Return ONLY compact valid JSON, no markdown, with this exact shape: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. Do not include explanations or evidence fields. Do not calculate indirect percentages. Never invent links.
+                retry_prompt = f"""Extract ALL direct ownership links from every layer in the source below, including owners of intermediate holding companies. The company at the top of a typical chart is the owned entity; lower connected shareholder boxes own the percentages shown beside their branches. Follow every layer and do not stop at the main entity's direct shareholders. Return ONLY compact valid JSON, no markdown, with this exact shape: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. Do not include explanations or evidence fields. Do not calculate indirect percentages. Never invent links.
 
 SOURCE:
 {document_text[:35000]}"""
@@ -797,7 +807,7 @@ SOURCE:
                 and diagram_pct_count >= 3
                 and len(current_links) < minimum_expected_links
             ):
-                completeness_prompt = f"""Extract every direct ownership link in this MULTI-LAYER OWNERSHIP DIAGRAM. The company at the top is the owned entity; connected shareholder boxes below it own the percentages shown beside their branches. Continue through every lower layer. The source contains about {diagram_pct_count} separate percentage labels, so check that each label is assigned to the correct connected owner and entity. Return ONLY compact valid JSON: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. No explanations, no markdown, no indirect calculations, and do not invent links.
+                completeness_prompt = f"""Extract every direct ownership link in every layer of this MULTI-LAYER OWNERSHIP DIAGRAM, including shareholders of intermediate companies. The company at the top is the owned entity; connected shareholder boxes below it own the percentages shown beside their branches. Continue through every lower layer; do not return only the main company's direct shareholders. The source contains about {diagram_pct_count} separate percentage labels, so check that each label is assigned to the correct connected owner and entity. Return ONLY compact valid JSON: {{\"ownership_links\":[{{\"owner\":\"name\",\"owned_entity\":\"entity\",\"direct_ownership_percent\":25}}]}}. No explanations, no markdown, no indirect calculations, and do not invent links.
 
 SOURCE:
 {document_text[:35000]}"""
@@ -931,8 +941,8 @@ SOURCE:
                     st.subheader("Ownership Structure")
                     if structure_rows:
                         structure_df = pd.DataFrame(structure_rows)[[
-                            "Entity", "Shareholder / ownership", "Ownership %",
-                            "Ownership % in Current Company", "Total Ownership %"
+                            "Entity", "Shareholder / ownership", "Ownership Level",
+                            "Ownership %", "Ownership % in Current Company", "Total Ownership %"
                         ]]
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
