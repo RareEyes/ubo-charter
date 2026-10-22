@@ -915,6 +915,12 @@ def looks_like_company(name):
     return False
 
 
+def looks_like_person(name):
+    """Conservative person-name check used to catch reversed ownership links."""
+    tokens = name_tokens(name)
+    return bool(tokens and tokens[0] in _PERSON_TITLES)
+
+
 def unify_similar_names(rows):
     """Treat spelling variants of the same name (across documents) as one party.
 
@@ -1327,6 +1333,28 @@ DOCUMENT TEXT:
                             r"(?i)^position\s+x\s*=\s*[-\d.]+\s*,\s*y\s*=\s*[-\d.]+\s*:\s*",
                             "", str(row[field])
                         ).strip()
+                # Repair isolated reversed links in mixed-format uploads. The model can
+                # occasionally return a titled individual as the owned entity and a
+                # company as the owner, even when neighbouring links are correctly
+                # oriented. A titled person is not treated as an entity to be drilled
+                # through; reverse only this clearly inconsistent pattern.
+                repaired_directions = 0
+                for row in rows:
+                    owner_name = str(row.get("Owner / shareholder", "")).strip()
+                    entity_name = str(row.get("Owned entity", "")).strip()
+                    if looks_like_person(entity_name) and not looks_like_person(owner_name):
+                        row["Owner / shareholder"], row["Owned entity"] = entity_name, owner_name
+                        row["Evidence / page"] = (
+                            str(row.get("Evidence / page", "")) +
+                            " | Direction corrected: individual detected as entity"
+                        ).strip(" |")
+                        repaired_directions += 1
+                if repaired_directions:
+                    st.info(
+                        f"Corrected {repaired_directions} ownership link(s) where a titled individual "
+                        "had been extracted as the owned entity. Please verify these links against the source documents."
+                    )
+
                 # Join the documents together: treat spelling variants of the same
                 # person/company as one party, then drop repeated links.
                 rows, name_merges = unify_similar_names(rows)
