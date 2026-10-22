@@ -1140,6 +1140,7 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
     else:
         try:
             result = {"ownership_links": []}
+            mentioned_parties = []
             if ai_documents:
                 from groq import Groq
                 import time
@@ -1208,10 +1209,12 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                         source_text = source_text[:14000]
                         prompt = f"""
 You extract direct ownership links from this ONE corporate document. Return ONLY JSON:
-{{"ownership_links":[{{"owner":"Shareholder name","owned_entity":"Company name","direct_ownership_percent":25.0}}]}}
+{{"ownership_links":[{{"owner":"Shareholder name","owned_entity":"Company name","direct_ownership_percent":25.0}}],"entities_mentioned":["every company or individual named as an owner, shareholder, or owned entity in the ownership evidence"]}}
 
 Rules:
-- Extract every supported direct ownership link in this document, including all layers and branches.
+- Extract EVERY supported direct ownership link in this document, including all layers, branches, minority shareholders, and small percentages. Do not omit a shareholder because their percentage is low or less significant.
+- Also list every company and individual named in the ownership context in entities_mentioned, even if you cannot confidently pair that name with a percentage/link. Do not include unrelated signatories or names outside the ownership context.
+- Check the full document carefully for each owner name and each ownership percentage; a small shareholder is still a required ownership link.
 - Each percentage belongs to the direct owner of the stated entity; do not calculate indirect percentages.
 - In written text, “Company A is owned 60% by Company B” means Company B owns 60% of Company A.
 - For diagrams, follow visible connectors/arrows and assign percentages to their corresponding branches. Use OCR coordinates to distinguish layers; do not connect labels merely because they are nearby.
@@ -1226,25 +1229,34 @@ DOCUMENT TEXT:
 """
                         extracted = groq_extract(prompt, doc["images"])
                         links = extracted.get("ownership_links", [])
+                        mentioned_parties.extend(
+                            str(name).strip() for name in extracted.get("entities_mentioned", [])
+                            if isinstance(name, str) and name.strip()
+                        )
 
-                        # If a diagram's response appears incomplete, make one focused
-                        # retry for this document only (not the whole upload bundle).
+                        # Run a completeness pass whenever the document contains several
+                        # percentages but fewer extracted links than expected. This applies
+                        # to written, pictorial, scanned, and mixed-format documents; minority
+                        # shareholders must not be dropped just because their percentage is small.
                         pct_count = len(re.findall(r"\b\d+(?:\.\d+)?\s*%", source_text))
-                        has_written_ownership = bool(re.search(
-                            r"(?i)\b(?:is|are|was|were)\s+(?:\d+(?:\.\d+)?%\s+)?(?:owned|held)\b|\bowned\s+\d+(?:\.\d+)?%\s+by\b",
-                            source_text,
-                        ))
-                        if not has_written_ownership and pct_count >= 3 and len(links) < max(2, int(pct_count * 0.5)):
+                        if pct_count >= 3 and len(links) < pct_count:
                             retry_prompt = f"""
-Re-check this single ownership diagram and extract ALL direct owner-to-entity links across every layer. Do not omit branches or intermediate companies. Assign each percentage only to the branch supported by the diagram. Do not calculate indirect percentages or invent links. Return only JSON in this shape: {{"ownership_links":[{{"owner":"name","owned_entity":"entity","direct_ownership_percent":25}}]}}.
+Perform a completeness audit of this ONE document. Re-extract every direct ownership link and compare it against every visible or written percentage and every shareholder/entity name. Include minority shareholders and low percentages; do not omit a link because it is less significant. Preserve all intermediate company layers. Also return every company and individual named in the ownership context in entities_mentioned, including names whose link or percentage is unclear. For diagrams, follow the actual connectors/branches, not label proximity. Do not calculate indirect percentages or invent links. Return only JSON in this shape: {{"ownership_links":[{{"owner":"name","owned_entity":"entity","direct_ownership_percent":25}}],"entities_mentioned":["name"]}}.
 
 SOURCE DOCUMENT: {doc['name']}
 DOCUMENT TEXT:
 {source_text}
 """
                             retry_result = groq_extract(retry_prompt, doc["images"])
-                            if len(retry_result.get("ownership_links", [])) > len(links):
-                                links = retry_result["ownership_links"]
+                            retry_links = retry_result.get("ownership_links", [])
+                            mentioned_parties.extend(
+                                str(name).strip() for name in retry_result.get("entities_mentioned", [])
+                                if isinstance(name, str) and name.strip()
+                            )
+                            # Keep links found on either pass; exact duplicates are removed
+                            # later, after cross-document name normalization.
+                            if retry_links:
+                                links = links + retry_links
                         merged_links.extend(links)
                 result = {"ownership_links": merged_links}
 
@@ -1391,8 +1403,11 @@ DOCUMENT TEXT:
                         [row for row in individuals if row[3] + 1e-9 >= ownership_threshold],
                         key=lambda item: item[3], reverse=True,
                     )
+                    # Keep all terminal companies visible as open items, regardless of
+                    # the selected UBO threshold. The threshold filters the UBO Summary,
+                    # not whether an incomplete ownership chain is disclosed.
                     unresolved_companies = sorted(
-                        [row for row in end_companies if row[3] + 1e-9 >= ownership_threshold],
+                        end_companies,
                         key=lambda item: item[3], reverse=True,
                     )
 
@@ -1422,6 +1437,32 @@ DOCUMENT TEXT:
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No ownership structure could be built from the extracted links.")
+
+                    # Report ownership-context names detected by the model but not present
+                    # in any extracted owner/entity link, so a skipped minority shareholder
+                    # or intermediate entity is visible for manual review.
+                    linked_name_keys = {
+                        entity_key(str(row.get(field, "")))
+                        for row in rows
+                        for field in ("Owner / shareholder", "Owned entity")
+                        if str(row.get(field, "")).strip()
+                    }
+                    unlinked_mentioned = sorted({
+                        name.strip() for name in mentioned_parties
+                        if name.strip() and entity_key(name) not in linked_name_keys
+                    }, key=str.casefold)
+                    if unlinked_mentioned:
+                        st.subheader("Review items: ownership names not linked")
+                        st.warning(
+                            "These names were detected in the ownership context of the uploaded documents, "
+                            "but no extracted ownership link includes them. They may indicate a missed "
+                            "shareholder, intermediate company, or name that needs manual verification."
+                        )
+                        st.dataframe(pd.DataFrame([
+                            {"Name not linked in extracted ownership data": name}
+                            for name in unlinked_mentioned
+                        ]), use_container_width=True, hide_index=True)
+
                     if unresolved_companies:
                         st.subheader("Open items: companies with no owners found (not UBOs)")
                         st.warning(
