@@ -901,12 +901,11 @@ SOURCE:
                 if entity_key(main_entity) not in owners_by_entity:
                     st.error(f"No ownership links were found for '{main_entity}'. Check the Main Entity name or edit it above and generate again.")
                 else:
-                    # Calculate effective ownership directly from the ownership graph.
-                    # Only terminal owners (owners with no further ownership links in the
-                    # extracted graph) are treated as ultimate owners for this prototype.
-                    # This avoids making the UBO Summary depend on the display table.
-                    ubo_totals = calculate_ubo_totals(owners_by_entity, main_entity)
+                    # Build the ownership paths first, then derive the UBO Summary
+                    # from the terminal owners on those exact paths. This ensures the
+                    # summary uses the same graph that produced the visible structure.
                     structure_rows = build_ownership_structure(owners_by_entity, main_entity)
+                    ubo_totals = calculate_ubo_totals_from_structure(owners_by_entity, structure_rows)
 
                     st.subheader("UBO Summary")
                     qualifying_ubos = sorted(
@@ -921,33 +920,14 @@ SOURCE:
                         st.info(f"No ultimate owners meet the {ownership_threshold:g}% threshold based on the extracted ownership links.")
 
                     st.subheader("Ownership Structure")
-                    # Show only terminal owners who meet the configured threshold.
-                    # Companies/intermediaries are excluded; their ownership is traced
-                    # through to the individuals at the end of each ownership path.
-                    qualifying_owner_keys = {
-                        entity_key(name)
-                        for name, pct in ubo_totals
-                        if pct >= ownership_threshold
-                    }
-                    qualifying_structure_rows = [
-                        row for row in structure_rows
-                        if (
-                            entity_key(str(row.get("Shareholder / ownership", "")).strip())
-                            not in owners_by_entity
-                            and entity_key(str(row.get("Shareholder / ownership", "")).strip())
-                            in qualifying_owner_keys
-                        )
-                    ]
-                    if qualifying_structure_rows:
-                        structure_df = pd.DataFrame(qualifying_structure_rows)[[
+                    if structure_rows:
+                        structure_df = pd.DataFrame(structure_rows)[[
                             "Entity", "Shareholder / ownership", "Ownership %",
                             "Ownership % in Current Company", "Total Ownership %"
                         ]]
                         st.dataframe(structure_df, use_container_width=True, hide_index=True)
                     else:
-                        st.info(
-                            f"No individual ultimate owners meet the {ownership_threshold:g}% ownership threshold."
-                        )
+                        st.info("No ownership structure could be built from the extracted links.")
                     st.caption("Verify all extracted links against the source documents. Ownership calculations are path-based and do not determine legal UBO status or control.")
         except KeyError:
             st.error("GROQ_API_KEY is missing from Streamlit Secrets.")
