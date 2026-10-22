@@ -534,49 +534,6 @@ def infer_diagram_links(document_text):
     return inferred
 
 
-st.header("1. Upload company documents")
-uploads = st.file_uploader(
-    "Select one or more documents",
-    type=SUPPORTED,
-    accept_multiple_files=True,
-)
-
-document_text = ""
-visual_images = []
-geometric_rows = []
-if uploads:
-    st.success(f"{len(uploads)} document(s) uploaded in this session.")
-    extracted_documents = []
-    for uploaded in uploads:
-        text_content = extract_text(uploaded)
-        extracted_documents.append(f"\n\nDOCUMENT: {uploaded.name}\n{text_content}")
-        geometric_rows.extend(extract_docx_diagram_links(uploaded))
-        if len(visual_images) < 3:
-            visual_images.extend(extract_visual_images(uploaded, limit=3 - len(visual_images)))
-    document_text = "\n".join(extracted_documents)
-else:
-    st.info("Upload one or more documents to begin.")
-
-st.header("2. Analysis settings")
-settings_col1, settings_col2 = st.columns(2)
-with settings_col1:
-    ownership_threshold = st.number_input(
-        "Ownership Percentage",
-        min_value=0.0,
-        max_value=100.0,
-        value=25.0,
-        step=1.0,
-        help="Minimum total direct and indirect ownership percentage for inclusion in the UBO Summary.",
-    )
-with settings_col2:
-    main_entity_input = st.text_input(
-        "Main Entity",
-        value=st.session_state.get("main_entity", ""),
-        key="main_entity",
-        help="Enter the company being analysed. Leave blank to let AI infer it from the ownership links.",
-    )
-
-
 def extract_docx_diagram_links(uploaded_file):
     """Read ownership links directly from the shapes and connector lines of a Word diagram.
 
@@ -757,6 +714,49 @@ def extract_docx_diagram_links(uploaded_file):
                     "Evidence / page": "Word diagram",
                 })
     return all_rows
+
+
+st.header("1. Upload company documents")
+uploads = st.file_uploader(
+    "Select one or more documents",
+    type=SUPPORTED,
+    accept_multiple_files=True,
+)
+
+document_text = ""
+visual_images = []
+geometric_rows = []
+if uploads:
+    st.success(f"{len(uploads)} document(s) uploaded in this session.")
+    extracted_documents = []
+    for uploaded in uploads:
+        text_content = extract_text(uploaded)
+        extracted_documents.append(f"\n\nDOCUMENT: {uploaded.name}\n{text_content}")
+        geometric_rows.extend(extract_docx_diagram_links(uploaded))
+        if len(visual_images) < 3:
+            visual_images.extend(extract_visual_images(uploaded, limit=3 - len(visual_images)))
+    document_text = "\n".join(extracted_documents)
+else:
+    st.info("Upload one or more documents to begin.")
+
+st.header("2. Analysis settings")
+settings_col1, settings_col2 = st.columns(2)
+with settings_col1:
+    ownership_threshold = st.number_input(
+        "Ownership Percentage",
+        min_value=0.0,
+        max_value=100.0,
+        value=25.0,
+        step=1.0,
+        help="Minimum total direct and indirect ownership percentage for inclusion in the UBO Summary.",
+    )
+with settings_col2:
+    main_entity_input = st.text_input(
+        "Main Entity",
+        value=st.session_state.get("main_entity", ""),
+        key="main_entity",
+        help="Enter the company being analysed. Leave blank to let AI infer it from the ownership links.",
+    )
 
 
 def entity_key(value):
