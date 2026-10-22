@@ -1288,6 +1288,38 @@ DOCUMENT TEXT:
             if not rows:
                 st.warning("No ownership links with clear percentages were identified. Check that the document contains readable ownership details.")
             else:
+                # If the requested Main Entity appears only in the owner column, the
+                # extracted links are likely direction-reversed (common with diagrams).
+                # Reorient the graph so the Main Entity is the company whose owners are
+                # being identified. Do not do this when the Main Entity already appears
+                # as an owned entity, which is the expected orientation.
+                requested_main_key = entity_key(main_entity_input.strip())
+                main_as_owned = any(
+                    entity_key(str(row.get("Owned entity", ""))) == requested_main_key
+                    for row in rows
+                )
+                main_as_owner = any(
+                    entity_key(str(row.get("Owner / shareholder", ""))) == requested_main_key
+                    for row in rows
+                )
+                if main_as_owner and not main_as_owned:
+                    rows = [
+                        {
+                            **row,
+                            "Owner / shareholder": row.get("Owned entity", ""),
+                            "Owned entity": row.get("Owner / shareholder", ""),
+                            "Evidence / page": (
+                                str(row.get("Evidence / page", "")) +
+                                " | Ownership direction normalized using Main Entity anchor"
+                            ).strip(" |"),
+                        }
+                        for row in rows
+                    ]
+                    st.info(
+                        "The extracted ownership links appeared reversed relative to the Main Entity. "
+                        "Their direction was normalized using the Main Entity you entered; please verify against the source documents."
+                    )
+
                 # Always clean coordinate prefixes before building the ownership graph.
                 for row in rows:
                     for field in ("Owned entity", "Owner / shareholder"):
