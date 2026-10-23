@@ -1177,7 +1177,11 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                                     },
                                     {
                                         "role": "user",
-                                        "content": build_model_content(prompt_text, images),
+                                        "content": (
+                                            build_model_content(prompt, visual_images)
+                                            if model_name == "qwen/qwen3.8-27b"
+                                            else prompt
+                                        ),
                                     },
                                 ],
                                 temperature=0,
