@@ -1187,7 +1187,7 @@ def get_ai_providers():
         providers.append({
             "name": "Gemini", "key": key, "json_mode": True, "max_tokens": 8000,
             "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "model": _secret("GEMINI_MODEL", "gemini-3.8-flash"),
+            "model": _secret("GEMINI_MODEL", "gemini-2.5-flash"),
         })
     key = _secret("OPENROUTER_API_KEY")
     if key:
@@ -1241,6 +1241,56 @@ def parse_ownership_json(text):
     if not isinstance(parsed, dict) or not isinstance(parsed.get("ownership_links"), list):
         raise json.JSONDecodeError("Expected an ownership_links array", text, 0)
     return parsed
+
+
+def fix_reversed_diagram_links(per_doc, known_rows, main_entity=""):
+    """Catch a diagram that was read upside down.
+
+    A diagram's owned company must be the one that other documents show as a
+    shareholder (it is the link between documents). If that company only appears
+    as an OWNER inside the diagram, the arrows were read backwards, so flip them.
+    Returns the names of the documents that were corrected.
+    """
+    to_flip = []
+    main_key = entity_key(main_entity) if main_entity else None
+    for name, info in per_doc.items():
+        links = info["links"]
+        if not info["diagram"] or not links:
+            continue
+        owners_elsewhere, owned_elsewhere = set(), set()
+        for other_name, other in per_doc.items():
+            if other_name == name:
+                continue
+            for l in other["links"]:
+                owners_elsewhere.add(entity_key(str(l.get("owner", ""))))
+                owned_elsewhere.add(entity_key(str(l.get("owned_entity", ""))))
+        for r in known_rows:
+            owners_elsewhere.add(entity_key(str(r.get("Owner / shareholder", ""))))
+            owned_elsewhere.add(entity_key(str(r.get("Owned entity", ""))))
+        join = {
+            k for k in owners_elsewhere - owned_elsewhere
+            if k
+        }
+        owner_keys = {entity_key(str(l.get("owner", ""))) for l in links}
+        owned_keys = {entity_key(str(l.get("owned_entity", ""))) for l in links}
+        # The document that contains the Main Entity is the anchor; leave it alone.
+        if main_key and main_key in (owner_keys | owned_keys):
+            continue
+        sources = owner_keys - owned_keys     # only ever an owner in this diagram
+        sinks = owned_keys - owner_keys       # only ever owned in this diagram
+        company_join = {k for k in join if any(
+            entity_key(str(l.get("owner", ""))) == k and looks_like_company(str(l.get("owner", "")))
+            for other in per_doc.values() for l in other["links"]
+        ) or k in {entity_key(str(r.get("Owner / shareholder", ""))) for r in known_rows
+                   if looks_like_company(str(r.get("Owner / shareholder", "")))}}
+        if (sources & company_join) and not (sinks & company_join):
+            to_flip.append(name)
+    # Apply after checking every document, so one flip cannot change another's check.
+    for name in to_flip:
+        for l in per_doc[name]["links"]:
+            l["owner"], l["owned_entity"] = l.get("owned_entity", ""), l.get("owner", "")
+    return to_flip
+
 
 
 def compact_for_ai(text):
@@ -1354,6 +1404,7 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                     raise RuntimeError("All AI providers failed - " + " | ".join(problems))
 
                 merged_links = []
+                per_doc = {}
                 with st.spinner("Extracting ownership links from each document..."):
                     for doc in ai_documents:
                         # Remove OCR noise first, then split long documents into parts
@@ -1373,7 +1424,7 @@ Rules:
 - Extract every supported direct ownership link in this document, including all layers and branches. Owners can be individuals or companies.
 - Each percentage belongs to the direct owner of the stated entity; do not calculate indirect percentages.
 - In written text, “Company A is owned 60% by Company B” means Company B owns 60% of Company A.
-- For diagrams, follow visible connectors/arrows and assign percentages to their corresponding branches. Use OCR coordinates to distinguish layers; do not connect labels merely because they are nearby.
+- For diagrams: the ARROWHEAD points at the OWNER (shareholder). The box with no arrowhead on it is the OWNED company. A percentage written next to an arrowhead is the share held by the box that arrow points to. Example: an arrow going from box XYZ up to box Perk Ltd, labelled 30%, means Perk Ltd owns 30% of XYZ (owner=Perk Ltd, owned_entity=XYZ). Follow every arrow and every layer; do not connect labels merely because they are nearby.
 - Continue through every layer. A company that owns another company is an intermediate entity, not an ultimate individual owner.
 - Spell each name the same way every time. Fix obvious OCR typos (0/O, 1/l, rn/m) but never invent names.
 - Never invent names, percentages, or unsupported links. Return an empty array only when no direct ownership links are supported.
@@ -1407,10 +1458,15 @@ DOCUMENT TEXT:
                             # One bad file should not stop the other documents.
                             failed_docs.append(f"{doc['name']}: {exc}")
                             continue
-                        for link in doc_links:
-                            if isinstance(link, dict):
-                                link.setdefault("evidence", doc["name"])
-                                merged_links.append(link)
+                        good_links = [l for l in doc_links if isinstance(l, dict)]
+                        per_doc[doc["name"]] = {"links": good_links, "diagram": not re.search(WRITTEN_OWNERSHIP_RE, source_text)}
+                        for link in good_links:
+                            link.setdefault("evidence", doc["name"])
+                            merged_links.append(link)
+                known_rows = [dict(r) for r in geometric_rows] + extract_written_ownership_links(document_text)
+                flipped_docs = fix_reversed_diagram_links(per_doc, known_rows, main_entity_input.strip())
+                if flipped_docs:
+                    st.info("The arrows in these diagrams were read the wrong way round and were corrected using the other documents: " + ", ".join(flipped_docs) + ". Please verify.")
                 result = {"ownership_links": merged_links}
                 if provider_used:
                     st.caption("AI used: " + ", ".join(f"{name} ({count} call{'s' if count != 1 else ''})" for name, count in provider_used.items()))
