@@ -1157,41 +1157,57 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                     return parsed
 
                 def groq_extract(prompt_text, images):
-                    # A short retry handles transient rate limits. Each file is sent
-                    # independently, and only its own image is attached to its request.
+                    models = [
+                        "qwen/qwen3.8-27b",
+                        "openai/gpt-oss-120b",
+                        "openai/gpt-oss-20b",
+                    ]
+
                     last_error = None
-                    for attempt in range(3):
+
+                    for model_name in models:
                         try:
                             response = client.chat.completions.create(
-                                model="qwen/qwen3.8-27b",
-                                max_tokens=1000,
+                                model=model_name,
+                                max_tokens=1800,
                                 messages=[
-                                    {"role": "system", "content": "Extract ownership data accurately and return valid JSON only."},
-                                    {"role": "user", "content": build_model_content(prompt_text, images)},
+                                    {
+                                        "role": "system",
+                                        "content": "Extract ownership data accurately and return valid JSON only."
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": build_model_content(prompt_text, images),
+                                    },
                                 ],
                                 temperature=0,
                                 response_format={"type": "json_object"},
                             )
-                            return parse_ownership_json(response.choices[0].message.content or "")
+
+                            return parse_ownership_json(
+                                response.choices[0].message.content or ""
+                            )
+
                         except Exception as exc:
                             message = str(exc).casefold()
                             status = getattr(exc, "status_code", None)
-                            is_token_rate_limit = (
-                                status in (413, 429)
-                                or "rate_limit_exceeded" in message
-                                or "tokens per minute" in message
-                                or "requested tokens exceed" in message
-                            )
-                            if not is_token_rate_limit:
-                                raise
-                            last_error = exc
-                            # Groq may report this TPM limit as 413 or 429. Wait for
-                            # the window to reset instead of immediately repeating a failed call.
-                            if attempt < 2:
-                                time.sleep(65)
-                    if last_error:
-                        raise last_error
 
+                            is_rate_limit = (
+                                status == 429
+                                or "rate_limit_exceeded" in message
+                                or "tokens per day" in message
+                                or "tokens per minute" in message
+                                or "requests per day" in message
+                                or "rate limit" in message
+                            )
+
+                             if not is_rate_limit:
+                                raise
+
+                             last_error = exc
+
+                    raise last_error
+                
                 merged_links = []
                 with st.spinner("Extracting ownership links from each document..."):
                     for doc in ai_documents:
