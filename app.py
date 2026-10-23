@@ -1204,7 +1204,7 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                             if not is_rate_limit:
                                 raise
 
-                             last_error = exc
+                            last_error = exc
 
                     raise last_error
                 
