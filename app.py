@@ -1179,7 +1179,7 @@ if st.button("Generate UBO Results", type="primary", disabled=not (bool(uploads)
                                         "role": "user",
                                         "content": (
                                             build_model_content(prompt, visual_images)
-                                            if model_name == "qwen/qwen3.8-27b"
+                                            if model_name == "qwen/qwen3.8-27b" and "visual_images" in locals()
                                             else prompt
                                         ),
                                     },
